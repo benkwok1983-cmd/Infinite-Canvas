@@ -19,7 +19,7 @@
 
 | 任务 | 内容 | 状态 |
 |---|---|---|
-| T1.1 | 编写独立验证脚本（`tools/zcode-verify/`，不进产品链路）：用 `gpt-image-2-skill request create --body-file` 构造三组 body（auto / flare / sunburst），外层宿主模型取本机解析值；开启 `--json-events` 捕获事件 | 待办 |
+| T1.1 | 编写独立验证脚本（`tools/zcode-verify/`，不进产品链路）：用 `gpt-image-2-skill request create --body-file` 构造三组 body（auto / flare / sunburst），外层宿主模型取本机解析值；开启 `--json-events` 捕获事件 | ✅ 2026-09-19 |
 | T1.2 | **【需用户授权额度】**跑 3 次真实生图，记录：宿主模型、请求的 tools[].model、响应事件中的观察模型、实际图片尺寸、耗时 | ⏸ 阻塞：用户 ChatGPT 订阅额度已耗尽，预计 2026-09-20 重置；用户确认后执行 |
 | T1.3 | 输出验证报告 `log/PHASE1-verification.md`；按结果确认实现细节（若三次均返回 `gpt-image-2-codex` 别名 → 维持「实验性」文案与诚实反馈设计；若 flare/sunburst 之一被确认 → 调整 UI 标注） | 待办（依赖 T1.2） |
 
