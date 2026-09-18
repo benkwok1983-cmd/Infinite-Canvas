@@ -1,0 +1,242 @@
+import os
+import sys
+import json
+import shutil
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import main
+
+
+def make_skill_dir(root, name="demo", with_md=True, scripts=False, references=False, assets=False):
+    path = os.path.join(root, name)
+    os.makedirs(path, exist_ok=True)
+    if with_md:
+        (Path(path) / "SKILL.md").write_text(
+            "---\nname: demo\nversion: 1.0\nlicense: MIT\n---\n\nBody text here.\n", encoding="utf-8"
+        )
+    if scripts:
+        (Path(path) / "scripts").mkdir()
+        (Path(path) / "scripts" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+    if references:
+        (Path(path) / "references").mkdir()
+        (Path(path) / "references" / "style.md").write_text("style guide\n", encoding="utf-8")
+    if assets:
+        (Path(path) / "assets").mkdir()
+        (Path(path) / "assets" / "palette.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    return path
+
+
+class SkillParseTests(unittest.TestCase):
+    def test_parse_standard_frontmatter(self):
+        fm, body = main.parse_skill_markdown_text("---\nname: demo\nversion: 1.0\ntags:\n  - a\n  - b\n---\n\nBody\n")
+        self.assertEqual(fm["name"], "demo")
+        self.assertEqual(str(fm["version"]), "1.0")
+        self.assertEqual(fm["tags"], ["a", "b"])
+        self.assertTrue(body.strip().startswith("Body"))
+
+    def test_parse_without_frontmatter(self):
+        fm, body = main.parse_skill_markdown_text("# Just markdown\n")
+        self.assertEqual(fm, {})
+        self.assertIn("Just markdown", body)
+
+    def test_parse_broken_yaml_falls_back_to_flat(self):
+        text = "---\nname: demo\nbad: [unclosed\n---\nBody\n"
+        fm, body = main.parse_skill_markdown_text(text)
+        self.assertEqual(fm.get("name"), "demo")
+        self.assertIn("Body", body)
+
+    def test_normalize_skill_id(self):
+        self.assertEqual(main.normalize_skill_id("My Cool Skill! (v2)"), "my-cool-skill-v2")
+        self.assertFalse(main.SKILL_ID_RE.match(main.normalize_skill_id("..")))
+        self.assertTrue(main.SKILL_ID_RE.match(main.normalize_skill_id("Watercolor-Style 2")))
+
+
+class SkillScanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_entry_flags_scripts_references_and_warnings(self):
+        path = make_skill_dir(self.root, scripts=True, references=True, assets=True)
+        entry = main.skill_entry_from_dir(path, "custom", include_body=True)
+        self.assertTrue(entry["has_skill_md"])
+        self.assertTrue(entry["has_scripts"])
+        self.assertEqual(entry["references_count"], 1)
+        self.assertEqual(entry["assets_count"], 1)
+        self.assertEqual(entry["license"], "MIT")
+        self.assertEqual(entry["body"].strip(), "Body text here.")
+        self.assertTrue(any("脚本" in w for w in entry["warnings"]))
+
+    def test_entry_missing_md_warns(self):
+        path = make_skill_dir(self.root, with_md=False)
+        entry = main.skill_entry_from_dir(path, "custom")
+        self.assertFalse(entry["has_skill_md"])
+        self.assertTrue(any("SKILL.md" in w for w in entry["warnings"]))
+
+    def test_traversal_blocked(self):
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.skill_dir_for("custom", "../..")
+        self.assertEqual(ctx.exception.status_code, 400)
+        with self.assertRaises(main.HTTPException):
+            main.skill_dir_for("custom", "..\\evil")
+        with self.assertRaises(main.HTTPException):
+            main.skill_dir_for("custom", "UPPER/CASE")
+
+    def test_custom_crud_roundtrip(self):
+        with patch.object(main, "SKILLS_CUSTOM_DIR", os.path.join(self.root, "custom")):
+            os.makedirs(main.SKILLS_CUSTOM_DIR, exist_ok=True)
+            created = main.skill_entry_from_dir(make_skill_dir(main.SKILLS_CUSTOM_DIR, "demo"), "custom")
+            self.assertEqual(created["id"], "demo")
+            self.assertIn("install", created)
+            # 删除走 skill_dir_for 校验
+            target = main.skill_dir_for("custom", "demo")
+            shutil.rmtree(target)
+            with self.assertRaises(main.HTTPException):
+                main.skill_dir_for("custom", "demo")
+
+
+class SkillZipSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _zip(self, entries, name="s.zip"):
+        zip_path = os.path.join(self.root, name)
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            for filename, data in entries:
+                archive.writestr(filename, data)
+        return zip_path
+
+    def test_safe_extract_normal_repo_layout(self):
+        zip_path = self._zip([
+            ("owner-repo-sha/SKILL.md", "---\nname: demo\n---\nBody"),
+            ("owner-repo-sha/references/g.md", "guide"),
+        ])
+        dest = os.path.join(self.root, "out")
+        os.makedirs(dest)
+        root = main.safe_extract_skill_zip(zip_path, dest)
+        self.assertTrue(os.path.isfile(os.path.join(root, "SKILL.md")))
+
+    def test_zip_slip_entry_rejected(self):
+        zip_path = self._zip([
+            ("top/SKILL.md", "x"),
+            ("top/../../evil.txt", "evil"),
+        ])
+        dest = os.path.join(self.root, "out2")
+        os.makedirs(dest)
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.safe_extract_skill_zip(zip_path, dest)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_bad_zip_rejected(self):
+        bad = os.path.join(self.root, "bad.zip")
+        Path(bad).write_bytes(b"not a zip at all")
+        dest = os.path.join(self.root, "out3")
+        os.makedirs(dest)
+        with self.assertRaises(main.HTTPException):
+            main.safe_extract_skill_zip(bad, dest)
+
+    def test_locate_root_prefers_repo_root(self):
+        repo = make_skill_dir(self.root, name="repo", with_md=True)
+        found, rel = main.locate_skill_root(repo)
+        self.assertEqual(found, repo)
+        self.assertEqual(rel, "")
+
+    def test_locate_root_unique_subdir(self):
+        repo = os.path.join(self.root, "repo")
+        os.makedirs(repo)
+        make_skill_dir(repo, name="sub", with_md=True)
+        found, rel = main.locate_skill_root(repo)
+        self.assertEqual(os.path.basename(found), "sub")
+        self.assertEqual(rel, "sub")
+
+    def test_locate_root_multiple_candidates_rejected(self):
+        repo = os.path.join(self.root, "repo2")
+        os.makedirs(repo)
+        make_skill_dir(repo, name="a", with_md=True)
+        make_skill_dir(repo, name="b", with_md=True)
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.locate_skill_root(repo)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_stage_rejects_missing_skill_md(self):
+        src = make_skill_dir(self.root, name="src", with_md=False)
+        staged = os.path.join(self.root, "staged")
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.validate_and_stage_skill(src, staged)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
+class SkillSlugTests(unittest.TestCase):
+    def test_repo_slug_variants(self):
+        self.assertEqual(main.github_repo_slug("https://github.com/owner/repo"), ("owner", "repo", ""))
+        self.assertEqual(main.github_repo_slug("https://github.com/owner/repo.git"), ("owner", "repo", ""))
+        self.assertEqual(main.github_repo_slug("https://github.com/owner/repo/tree/dev"), ("owner", "repo", "dev"))
+        self.assertEqual(main.github_repo_slug("https://evil.com/owner/repo"), ("", "", ""))
+        self.assertEqual(main.github_repo_slug("not a url"), ("", "", ""))
+
+
+class SkillsApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.custom_dir = os.path.join(self.tmp.name, "custom")
+        os.makedirs(self.custom_dir)
+        self._patcher = patch.object(main, "SKILLS_CUSTOM_DIR", self.custom_dir)
+        self._patcher.start()
+        from fastapi.testclient import TestClient
+
+        self.client = TestClient(main.app)
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.tmp.cleanup()
+
+    def test_create_list_update_delete_flow(self):
+        resp = self.client.post("/api/skills/custom", json={"name": "My Style", "description": "测试风格", "content": "Body content here."})
+        self.assertEqual(resp.status_code, 200)
+        skill_id = resp.json()["id"]
+        self.assertEqual(skill_id, "my-style")
+        md_path = Path(self.custom_dir) / skill_id / "SKILL.md"
+        self.assertTrue(md_path.is_file())
+        self.assertIn("name: My Style", md_path.read_text(encoding="utf-8"))
+
+        listed = self.client.get("/api/skills").json()["skills"]
+        match = [s for s in listed if s["source"] == "custom" and s["id"] == skill_id]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0]["name"], "My Style")
+
+        dup = self.client.post("/api/skills/custom", json={"name": "my style"})
+        self.assertEqual(dup.status_code, 409)
+
+        detail = self.client.get(f"/api/skills/custom/{skill_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("Body", detail.json()["body"])
+
+        updated = self.client.put(f"/api/skills/custom/{skill_id}", json={"content": "---\nname: My Style\n---\n\nNew body\n"})
+        self.assertEqual(updated.status_code, 200)
+        self.assertIn("New body", md_path.read_text(encoding="utf-8"))
+
+        deleted = self.client.delete(f"/api/skills/custom/{skill_id}")
+        self.assertEqual(deleted.status_code, 200)
+        gone = self.client.get(f"/api/skills/custom/{skill_id}")
+        self.assertEqual(gone.status_code, 404)
+
+    def test_create_rejects_unusable_name(self):
+        # 纯符号名规范化后为空 → 400
+        resp = self.client.post("/api/skills/custom", json={"name": "!!!"})
+        self.assertEqual(resp.status_code, 400)
+
+
+if __name__ == "__main__":
+    unittest.main()

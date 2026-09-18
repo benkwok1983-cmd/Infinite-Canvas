@@ -19342,7 +19342,8 @@ class SkillUpdateRequest(BaseModel):
 
 def normalize_skill_id(value):
     text = re.sub(r"\s+", "-", str(value or "").strip().lower())
-    text = re.sub(r"[^a-z0-9._-]+", "-", text).strip("-._")
+    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
     return text[:64]
 
 def skill_source_root(source):
@@ -19594,6 +19595,294 @@ async def api_skill_delete(skill_id: str):
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"删除 Skill 失败：{exc}") from exc
     return {"ok": True}
+
+class SkillGithubPreviewRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+    ref: str = Field(default="", max_length=200)
+
+class SkillGithubInstallRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+    sha: str = Field(min_length=7, max_length=64)
+    name: str = Field(default="", max_length=64)
+    overwrite: bool = False
+
+class SkillUpgradeRequest(BaseModel):
+    sha: str = Field(default="", max_length=64)
+
+def github_repo_slug(url):
+    """从 GitHub URL 提取 (owner, repo, ref)。支持 /tree/{ref} 与 .git 后缀。"""
+    text = str(url or "").strip()
+    match = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/tree/([^/?#]+))?/?$", text)
+    if not match:
+        return "", "", ""
+    owner, repo, ref = match.group(1), match.group(2), (match.group(3) or "").strip()
+    return owner, repo, ref
+
+def github_api_headers():
+    headers = {"User-Agent": "Infinite-Canvas-Skill-Importer", "Accept": "application/vnd.github+json"}
+    token = str(os.getenv("GITHUB_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+async def github_download_repo_zip(url, sha_or_ref=""):
+    """下载仓库 zipball 到临时文件，返回 (temp_zip_path, slug_info)。"""
+    owner, repo, ref_from_url = github_repo_slug(url)
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="URL 需要是 https://github.com/{owner}/{repo} 形式的仓库地址")
+    branch = str(sha_or_ref or "").strip() or ref_from_url
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0), follow_redirects=True) as client:
+        try:
+            if branch:
+                commit_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}", headers=github_api_headers())
+                commit_resp.raise_for_status()
+                commit_data = commit_resp.json()
+                sha = str(commit_data.get("sha") or "")
+                commit_message = str((commit_data.get("commit") or {}).get("message") or "").splitlines()[0][:200]
+            else:
+                repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=github_api_headers())
+                repo_resp.raise_for_status()
+                repo_data = repo_resp.json()
+                branch = str(repo_data.get("default_branch") or "main")
+                commit_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}", headers=github_api_headers())
+                commit_resp.raise_for_status()
+                commit_data = commit_resp.json()
+                sha = str(commit_data.get("sha") or "")
+                commit_message = str((commit_data.get("commit") or {}).get("message") or "").splitlines()[0][:200]
+            if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+                raise HTTPException(status_code=502, detail=f"GitHub 返回的提交 SHA 异常：{sha[:60]}")
+            zip_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/zipball/{sha}", headers=github_api_headers())
+            zip_resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            detail = "GitHub 仓库不存在或不可访问" if status == 404 else ("GitHub API 限流，稍后再试或配置 GITHUB_TOKEN" if status in (403, 429) else f"GitHub 请求失败：HTTP {status}")
+            raise HTTPException(status_code=502, detail=detail) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"GitHub 网络请求失败：{exc}") from exc
+        if len(zip_resp.content) > SKILLS_ZIP_MAX_BYTES:
+            raise HTTPException(status_code=400, detail=f"仓库压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
+        fd, temp_zip = tempfile.mkstemp(prefix="skill_repo_", suffix=".zip")
+        with os.fdopen(fd, "wb") as f:
+            f.write(zip_resp.content)
+    return temp_zip, {"owner": owner, "repo": repo, "ref": branch, "sha": sha, "commit_message": commit_message}
+
+def safe_extract_skill_zip(zip_path, dest_root):
+    """解压 zip 到 dest_root，带 zip-slip/大小/数量防护。返回解压根目录（zip 内唯一顶层目录）。"""
+    total_bytes = 0
+    file_count = 0
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            names = archive.namelist()
+            if not names:
+                raise HTTPException(status_code=400, detail="压缩包为空")
+            top_prefix = names[0].split("/")[0] + "/"
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                rel = info.filename
+                if rel.startswith(top_prefix):
+                    rel = rel[len(top_prefix):]
+                if not rel or rel.startswith("/") or ".." in rel.replace("\\", "/").split("/") or ":" in rel:
+                    raise HTTPException(status_code=400, detail=f"压缩包含非法路径：{info.filename[:80]}")
+                file_count += 1
+                total_bytes += info.file_size
+                if file_count > SKILLS_MAX_FILES:
+                    raise HTTPException(status_code=400, detail=f"文件数超过 {SKILLS_MAX_FILES} 上限")
+                if total_bytes > SKILLS_MAX_TOTAL_BYTES:
+                    raise HTTPException(status_code=400, detail=f"解压后超过 {SKILLS_MAX_TOTAL_BYTES // (1024*1024)}MB 上限")
+            archive.extractall(dest_root)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="压缩包格式无效") from exc
+    entries = [name for name in os.listdir(dest_root) if not name.startswith(".")]
+    if len(entries) != 1 or not os.path.isdir(os.path.join(dest_root, entries[0])):
+        raise HTTPException(status_code=400, detail="压缩包结构异常（应只有一个顶层目录）")
+    return os.path.join(dest_root, entries[0])
+
+def locate_skill_root(extracted_root):
+    """定位 SKILL.md：优先仓库根；否则要求恰好一个含 SKILL.md 的子目录。"""
+    if os.path.isfile(os.path.join(extracted_root, "SKILL.md")):
+        return extracted_root, ""
+    candidates = []
+    for root, dirs, names in os.walk(extracted_root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if "SKILL.md" in names:
+            candidates.append(root)
+    if len(candidates) == 1:
+        found = candidates[0]
+        rel = os.path.relpath(found, extracted_root).replace("\\", "/")
+        return found, rel
+    if not candidates:
+        raise HTTPException(status_code=400, detail="仓库中未找到 SKILL.md（支持仓库根目录，或唯一包含 SKILL.md 的子目录）")
+    listing = "、".join(os.path.relpath(c, extracted_root).replace("\\", "/") for c in candidates[:5])
+    raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}），请指定包含目标 Skill 的仓库子目录后重试")
+
+def validate_and_stage_skill(skill_root, staged_root):
+    """校验 skill_root 并复制到 staged_root（临时暂存），返回 (entry, warnings)。"""
+    shutil.copytree(skill_root, staged_root, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git*", "__pycache__*"))
+    entry = skill_entry_from_dir(staged_root, "custom", include_body=False)
+    if not entry["has_skill_md"]:
+        raise HTTPException(status_code=400, detail="目标目录缺少 SKILL.md，不能作为 Skill 安装")
+    return entry
+
+@app.post("/api/skills/github/preview")
+async def api_skill_github_preview(payload: SkillGithubPreviewRequest):
+    temp_zip, info = await github_download_repo_zip(payload.url, payload.ref)
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_preview_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, skill_rel = locate_skill_root(extracted_root)
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            return {
+                "ok": True,
+                "repo": info,
+                "skill_root": skill_rel,
+                "skill": entry,
+                "confirm_required": True,
+            }
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+@app.post("/api/skills/github/install")
+async def api_skill_github_install(payload: SkillGithubInstallRequest):
+    if not re.fullmatch(r"[0-9a-f]{7,64}", str(payload.sha or "")):
+        raise HTTPException(status_code=400, detail="SHA 格式不合法")
+    skill_id = normalize_skill_id(payload.name)
+    temp_zip, info = await github_download_repo_zip(payload.url, payload.sha)
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_install_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, skill_rel = locate_skill_root(extracted_root)
+            if not skill_id:
+                skill_id = normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
+            if not SKILL_ID_RE.match(skill_id):
+                raise HTTPException(status_code=400, detail=f"从 SKILL.md/仓库名推导的 ID 不合法：{skill_id[:60]}，请手动指定名称")
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            target = os.path.join(skill_source_root("custom"), skill_id)
+            if os.path.exists(target):
+                if not payload.overwrite:
+                    raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
+                shutil.rmtree(target)
+            shutil.move(staged, target)
+            skill_write_meta(target, {
+                "source": "github",
+                "repo_url": f"https://github.com/{info['owner']}/{info['repo']}",
+                "commit_sha": info["sha"],
+                "ref": info["ref"],
+                "skill_root": skill_rel,
+                "installed_at": now_ms(),
+            })
+            return {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(target, "custom")}
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+@app.post("/api/skills/zip/install")
+async def api_skill_zip_install(file: UploadFile = File(...)):
+    content = await file.read()
+    if len(content) > SKILLS_ZIP_MAX_BYTES:
+        raise HTTPException(status_code=400, detail=f"压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
+    fd, temp_zip = tempfile.mkstemp(prefix="skill_zip_", suffix=".zip")
+    with os.fdopen(fd, "wb") as f:
+        f.write(content)
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_zip_install_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, _rel = locate_skill_root(extracted_root)
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            skill_id = normalize_skill_id(entry.get("name") or os.path.basename(skill_root.rstrip("/\\")))
+            if not SKILL_ID_RE.match(skill_id):
+                raise HTTPException(status_code=400, detail=f"从 SKILL.md 推导的 ID 不合法：{skill_id[:60]}")
+            target = os.path.join(skill_source_root("custom"), skill_id)
+            if os.path.exists(target):
+                shutil.rmtree(target)
+            shutil.move(staged, target)
+            skill_write_meta(target, {"source": "zip", "installed_at": now_ms()})
+            return {"ok": True, "id": skill_id, "skill": skill_entry_from_dir(target, "custom")}
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+@app.get("/api/skills/custom/{skill_id}/check-update")
+async def api_skill_check_update(skill_id: str):
+    dir_path = skill_dir_for("custom", skill_id)
+    meta = skill_read_meta(dir_path)
+    repo_url = str(meta.get("repo_url") or "")
+    if meta.get("source") != "github" or not repo_url:
+        raise HTTPException(status_code=400, detail="该 Skill 不是 GitHub 来源，无法检查更新")
+    current_sha = str(meta.get("commit_sha") or "")
+    temp_zip, info = await github_download_repo_zip(repo_url, str(meta.get("ref") or ""))
+    try:
+        os.remove(temp_zip)
+    except OSError:
+        pass
+    latest_sha = info.get("sha") or ""
+    return {
+        "ok": True,
+        "current_sha": current_sha,
+        "latest_sha": latest_sha,
+        "up_to_date": bool(current_sha and current_sha == latest_sha),
+        "latest_commit_message": info.get("commit_message") or "",
+        "repo_url": repo_url,
+    }
+
+@app.post("/api/skills/custom/{skill_id}/upgrade")
+async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
+    dir_path = skill_dir_for("custom", skill_id)
+    meta = skill_read_meta(dir_path)
+    repo_url = str(meta.get("repo_url") or "")
+    if meta.get("source") != "github" or not repo_url:
+        raise HTTPException(status_code=400, detail="该 Skill 不是 GitHub 来源，无法升级")
+    temp_zip, info = await github_download_repo_zip(repo_url, str(payload.sha or meta.get("ref") or ""))
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_upgrade_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, skill_rel = locate_skill_root(extracted_root)
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            backup = dir_path + ".upgrade-bak"
+            if os.path.exists(backup):
+                shutil.rmtree(backup)
+            os.rename(dir_path, backup)
+            try:
+                shutil.move(staged, dir_path)
+            except Exception:
+                os.rename(backup, dir_path)
+                raise
+            try:
+                shutil.rmtree(backup)
+            except OSError:
+                pass
+            skill_write_meta(dir_path, {
+                **meta,
+                "commit_sha": info["sha"],
+                "ref": info["ref"],
+                "skill_root": skill_rel,
+                "updated_at": now_ms(),
+            })
+            return {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(dir_path, "custom")}
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     import uvicorn
