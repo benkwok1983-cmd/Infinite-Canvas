@@ -20,10 +20,11 @@
 | 任务 | 内容 | 状态 |
 |---|---|---|
 | T1.1 | 编写独立验证脚本（`tools/zcode-verify/`，不进产品链路）：用 `gpt-image-2-skill request create --body-file` 构造三组 body（auto / flare / sunburst），外层宿主模型取本机解析值；开启 `--json-events` 捕获事件 | 待办 |
-| T1.2 | **【需用户授权额度】**跑 3 次真实生图，记录：宿主模型、请求的 tools[].model、响应事件中的观察模型、实际图片尺寸、耗时 | 待办 |
-| T1.3 | 输出验证报告 `log/PHASE1-verification.md`；按结果确认实现细节（若三次均返回 `gpt-image-2-codex` 别名 → 维持「实验性」文案与诚实反馈设计；若 flare/sunburst 之一被确认 → 调整 UI 标注） | 待办 |
+| T1.2 | **【需用户授权额度】**跑 3 次真实生图，记录：宿主模型、请求的 tools[].model、响应事件中的观察模型、实际图片尺寸、耗时 | ⏸ 阻塞：用户 ChatGPT 订阅额度已耗尽，预计 2026-09-20 重置；用户确认后执行 |
+| T1.3 | 输出验证报告 `log/PHASE1-verification.md`；按结果确认实现细节（若三次均返回 `gpt-image-2-codex` 别名 → 维持「实验性」文案与诚实反馈设计；若 flare/sunburst 之一被确认 → 调整 UI 标注） | 待办（依赖 T1.2） |
 
 > T1.2 未授权不阻塞 Phase 2 编码（单测先行），仅阻塞最终验收 AC1-5。
+> **额度替代约定（用户 2026-09-19 指示）**：非 Codex 通道的生图测试一律用 ModelScope 免费模型；Codex 通道额度验证统一等用户确认重置后再做。
 
 ## Phase 2：优化 1 —— 实现
 
