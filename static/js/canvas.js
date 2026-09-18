@@ -722,7 +722,18 @@ function providerOptions(selectedId){
 function providerImageModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
-    return uniqueModels(provider?.image_models || []);
+    const models = uniqueModels(provider?.image_models || []);
+    // Codex 订阅通道：始终提供实验性 Image 2.5 档位（服务端可能忽略选择，UI 须标注）
+    if(String(provider?.protocol || '').trim().toLowerCase() === 'codex'){
+        for(const model of CODEX_EXPERIMENTAL_IMAGE_MODELS){
+            if(!models.includes(model)) models.push(model);
+        }
+    }
+    return models;
+}
+const CODEX_EXPERIMENTAL_IMAGE_MODELS = ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'];
+function isExperimentalCodexImageModel(name){
+    return CODEX_EXPERIMENTAL_IMAGE_MODELS.includes(String(name || '').trim().toLowerCase());
 }
 function sanitizeImageNodeProviderModel(node){
     if(!node || node.type !== 'generator') return;
@@ -1071,7 +1082,7 @@ function imageModelOptions(selectedModel, providerId){
         return `<option value="" disabled selected>${tr('canvas.noImageModelsHint') || '暂无生图模型，请到 API 设置添加'}</option>`;
     }
     const selectedValue = resolveImageModel(selectedModel);
-    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model + (isExperimentalCodexImageModel(model) ? `（${tr('canvas.experimentalTag') || '实验'}）` : ''))}</option>`).join('');
     const hasSelected = models.includes(selectedValue);
     return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
 }
@@ -11313,6 +11324,7 @@ async function runGenerator(genId, opts={}){
         prompt: prompt || 'Edit the reference images.',
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
+        image_model:isExperimentalCodexImageModel(resolveImageModel(gen.model)) ? resolveImageModel(gen.model) : '',
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
@@ -13350,6 +13362,10 @@ function requestMetaFromResult(result={}){
         prompt_id: result.prompt_id || '',
         workflow_json: result.workflow_json || '',
         seed: result.seed || '',
+        image_model_requested: result.image_model_requested || '',
+        image_model_observed: result.image_model_observed || '',
+        image_model_confirmed: Boolean(result.image_model_confirmed),
+        image_size: Array.isArray(result.image_size) ? result.image_size : null,
     };
 }
 function runPlatformLabel(run){
@@ -13734,6 +13750,10 @@ function completeCanvasImageTask(taskId, result){
         run: pending.run || {},
     };
     meta.run.request = requestMetaFromResult(result);
+    if(result?.image_model_observed && !result.image_model_confirmed && result.image_model_requested && result.image_model_requested !== 'auto/latest'){
+        // canvas.js 无轻量 toast；未确认提示走溯源记录 + 控制台，不打断生成流
+        console.warn('[canvas] Image 2.5 未被服务端确认：requested=%s observed=%s', result.image_model_requested, result.image_model_observed);
+    }
     const images = result.images || [];
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     appendOutputImages(out, images, meta.run?.refs?.[0], [meta]);

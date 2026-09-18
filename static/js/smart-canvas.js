@@ -2499,7 +2499,23 @@ function videoProviderPlatform(providerId){
 }
 function providerImageModels(providerId){
     if(providerId === 'volcengine') return volcengineProvider().image_models || [];
-    return (apiProviders || []).find(p => p.id === providerId)?.image_models || [];
+    const provider = (apiProviders || []).find(p => p.id === providerId);
+    const models = [...(provider?.image_models || [])];
+    // Codex 订阅通道：始终提供实验性 Image 2.5 档位（服务端可能忽略选择，UI 须标注）
+    if(isCodexProtocolProvider(providerId)){
+        for(const model of CODEX_EXPERIMENTAL_IMAGE_MODELS){
+            if(!models.includes(model)) models.push(model);
+        }
+    }
+    return models;
+}
+const CODEX_EXPERIMENTAL_IMAGE_MODELS = ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'];
+function isCodexProtocolProvider(providerId){
+    const provider = (apiProviders || []).find(p => p.id === providerId);
+    return String(provider?.protocol || '').trim().toLowerCase() === 'codex';
+}
+function isExperimentalCodexImageModel(name){
+    return CODEX_EXPERIMENTAL_IMAGE_MODELS.includes(String(name || '').trim().toLowerCase());
 }
 const JIMENG_UPSCALE_RESOLUTIONS = ['2k', '4k', '8k'];
 function isJimengProviderId(providerId){
@@ -3246,7 +3262,7 @@ function renderModelControl(models){
         <div class="smart-popover compact-popover">
             <div class="smart-popover-title">${escapeHtml(tr('smart.imageModel'))}</div>
             <div class="model-list">
-                ${models.map(m => `<button type="button" class="direct-option ${m === settings.model ? 'active' : ''}" data-smart-param="model" data-smart-value="${escapeHtml(m)}"><span>${escapeHtml(m)}</span></button>`).join('') || `<div class="muted-note">${escapeHtml(tr('smart.noImageModel'))}</div>`}
+                ${models.map(m => `<button type="button" class="direct-option ${m === settings.model ? 'active' : ''}" data-smart-param="model" data-smart-value="${escapeHtml(m)}"><span>${escapeHtml(m)}${isExperimentalCodexImageModel(m) ? `<em class="exp-tag">${escapeHtml(tr('smart.experimentalTag'))}</em>` : ''}</span></button>`).join('') || `<div class="muted-note">${escapeHtml(tr('smart.noImageModel'))}</div>`}
             </div>
         </div>
     </div>`;
@@ -16270,6 +16286,7 @@ async function runApiGeneration(prompt, refs, runSettings=settings){
         prompt,
         provider_id:runSettings.provider_id,
         model:runSettings.model,
+        image_model:isExperimentalCodexImageModel(runSettings.model) ? runSettings.model : '',
         size:sizeForRun(runSettings),
         aspect_ratio:API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''),
         resolution:['1k','2k','4k'].includes(runSettings.resolution) ? runSettings.resolution : '',
@@ -17152,6 +17169,17 @@ async function resumeSmartPendingNode(node, logContext={}){
         if(task.failed && task.recoverTaskId) return;
         try {
             const result = await pollSmartCanvasTask(task.taskId);
+            if(result?.image_model_observed){
+                node.lastImageModelMeta = {
+                    requested:result.image_model_requested || '',
+                    observed:result.image_model_observed || '',
+                    confirmed:Boolean(result.image_model_confirmed),
+                    size:Array.isArray(result.image_size) ? result.image_size : null
+                };
+                if(!result.image_model_confirmed && result.image_model_requested && result.image_model_requested !== 'auto/latest'){
+                    toast(tr('smart.imageModelUnconfirmed'));
+                }
+            }
             finalizeSmartPendingTask(node, task.taskId, resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result)), task.kind || 'image');
             render();
             scheduleSave();

@@ -4,6 +4,7 @@
         "canvas.noApiProviders": { zh: "暂无 API 平台", en: "No API providers" },
         "canvas.noApiProvidersHint": { zh: "暂无 API 平台，请到 API 设置添加", en: "No API providers. Add one in API Settings." },
         "canvas.noImageModelsHint": { zh: "暂无生图模型，请到 API 设置添加", en: "No image models. Add some in API Settings." },
+        "canvas.experimentalTag": { zh: "实验", en: "EXP" },
         "canvas.noModelsHint": { zh: "暂无模型，请到 API 设置添加", en: "No models. Add some in API Settings." },
         "canvas.title": { zh: "无限画布", en: "Infinite Canvas" },
         "canvas.backToManager": { zh: "返回画布管理", en: "Back to canvas manager" },
