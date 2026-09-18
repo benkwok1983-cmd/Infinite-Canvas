@@ -32,6 +32,14 @@
 - 宿主模型 `gpt-5.6-sol` 与 2.5 body 的真实兼容性未验证（T1.2 顺带覆盖）。
 - P2 未修项见上。
 
+## 补记（2026-09-19 晚，用户澄清后修订）
+
+- **FR1-6 方向修正**：用户澄清「用订阅额度而非 API」指的是 **2.5 通道只走订阅**，并非删除 API 回退。已改为折中方案（经用户确认选 **UI 界面开关**）：
+  - 后端：恢复 auto/latest 档的 Codex→OpenAI 回退循环（原基线行为），新增 `codex_image_skill_attempts(provider, auth_file)` 可测函数；回退条件 = provider 开关 `allow_api_fallback` 开 且 本机有 API Key；`ApiProviderPayload`/`normalize_provider`/`public_provider` 全链路支持该字段。**实验档 request create 路径不经过 attempts，严格只走订阅**。
+  - 前端：API 设置页 Codex 卡片新增「API 回退」toggle（默认关，存 provider 配置，随「保存」生效），描述文案明示计费含义与 2.5 不受开关影响；i18n 沿用现有中文界面（该页未强制双语键）。
+  - 保留的改善：无回退可用时 401 直报「请重新登录 Codex」（替代基线的 `return None`→误导性「未找到 helper」400）。
+  - 单测 +4（开关×key 矩阵 + 非 codex 解析不回退），23/23 全绿。
+
 ## 下一步
 
 - Phase 2 收尾推送 → Phase 3（Skill 库后端 T3.1-T3.5）。

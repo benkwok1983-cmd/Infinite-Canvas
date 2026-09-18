@@ -37,7 +37,7 @@
 | FR1-3 | 外层宿主模型始终由 `codex_image_host_model()` 解析，`gpt-image-*` 值不得作为宿主模型传出 |
 | FR1-4 | 传参按实测最佳实践：期望尺寸/比例写入提示词（检查并强化现有 `gpt_image_2_skill_prompt_arg`）；`background=auto`；输出格式走参数；`codex_postprocess_image_to_requested_size` 保留尺寸校验，**如实报告原始尺寸，不虚标** |
 | FR1-5 | 诚实反馈：任务结果元数据记录并显示「请求的图片模型 / 服务端观察模型（响应事件 `tools[].model`）/ 实际尺寸」；观察为 `gpt-image-2-codex` 别名时明示「服务端未确认 2.5」 |
-| FR1-6 | **计费保护**：Codex 通道失败（含 401）一律直报错误并提示重新登录，**禁止自动回退 API key 通道**（收紧 main.py:5338-5340 的回退；不留隐藏开关则直接删除该回退） |
+| FR1-6 | **计费边界（2026-09-19 用户澄清后修订）**：2.5 实验档**严格只走 Codex 订阅通道**，任何情况下不回退 API；auto/latest 档的 Codex→API 回退改为 **provider 级 UI 开关**（`allow_api_fallback`，API 设置页 Codex 卡片内，默认关）——开启且本机配置了 API Key 时，Codex 401 自动切 API 通道出图（该图按 API 计费）；关闭时 401 直报并提示重新登录 |
 | FR1-7 | 验证：单测覆盖 body 构造 / 模型路由 / 回退禁用 / 尺寸映射，零额度消耗；端到端真实生图验收需用户单独授权额度 |
 | FR1-8 | UI 文案：Codex 生图相关文案由「GPT Image 2」更新为「ChatGPT Images / Codex 图像生成」，涉及 i18n 词条同步（zh/en） |
 

@@ -19,9 +19,9 @@
     <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.28.1788924940"></script>
     <script src="/static/vendor/js/lucide.js?v=2026.08.28.1788924938"></script>
     <script src="/static/js/theme.js?v=2026.08.28.1788924902"></script>
-    <script src="/static/js/i18n.js?v=2026.08.28.1788924853"></script>
+    <script src="/static/js/i18n.js?v=2026.08.28.1789750658"></script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.28.1788924798">
-    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.28.1788924771">
+    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.09.19.1789755516">
 </head>
 <body>
     <div class="page">
@@ -252,6 +252,14 @@
                                     <button class="action-btn primary-btn" type="button" onclick="refreshCodexStatus()"><i data-lucide="radar" class="w-3.5 h-3.5"></i><span>检测 CLI</span></button>
                                     <button class="action-btn" type="button" onclick="openCodexHelp()"><i data-lucide="terminal" class="w-3.5 h-3.5"></i><span>帮助</span></button>
                                 </div>
+                                <label class="codex-fallback-row" for="codexApiFallback">
+                                    <span class="codex-fallback-text">
+                                        <span class="rh-key-title">API 回退</span>
+                                        <span class="rh-key-desc">Codex 登录过期时，自动改用 OpenAI API Key 生成图片（该图按 API 计费，需已配置 API Key）。关闭时仅报错并提示重新登录。实验性 Image 2.5 不受此开关影响，始终使用订阅额度。</span>
+                                    </span>
+                                    <input type="checkbox" id="codexApiFallback" hidden>
+                                    <span class="rh-preview-switch codex-fallback-switch"><span></span></span>
+                                </label>
                                 <div id="codexCliInfo" class="jimeng-credit"></div>
                             </div>
                             <div id="geminiCliPanel" class="jimeng-cli-panel" hidden>
@@ -581,6 +589,6 @@
         </div>
     </div>
 
-    <script src="/static/js/api-settings.js?v=2026.08.28.1788924828"></script>
+    <script src="/static/js/api-settings.js?v=2026.09.19.1789755516"></script>
 </body>
 </html>

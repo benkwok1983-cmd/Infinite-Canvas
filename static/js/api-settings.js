@@ -776,6 +776,9 @@ function syncEditor(){
             ? 'general'
             : (imageEditRouteInput?.value || item.image_edit_route)
     );
+    if(selectedProtocol === 'codex'){
+        item.allow_api_fallback = Boolean(document.getElementById('codexApiFallback')?.checked);
+    }
     item.image_generation_endpoint = '';
     item.image_edit_endpoint = '';
     item.rh_apps = normalizeRhEntries(item.rh_apps || [], 'app');
@@ -2547,6 +2550,8 @@ function renderEditor(){
     document.body.classList.toggle('show-jimeng', isJimeng);
     document.body.classList.toggle('show-codex', isCodex);
     document.body.classList.toggle('show-gemini-cli', isGeminiCli);
+    const codexApiFallbackInput = document.getElementById('codexApiFallback');
+    if(codexApiFallbackInput) codexApiFallbackInput.checked = Boolean(item.allow_api_fallback);
     updateApimartDomesticHint(item);
     renderProviderOnboarding(item);
     renderRecommendApi();

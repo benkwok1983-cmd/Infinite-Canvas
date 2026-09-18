@@ -169,15 +169,52 @@ class CodexImageRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_model_is_passed_through_to_skill_call(self):
         captured = {}
 
-        async def fake_skill(prompt, size, model, ref_paths=None, image_model=""):
+        async def fake_skill(prompt, size, model, ref_paths=None, image_model="", provider=None):
             captured["image_model"] = image_model
             captured["model"] = model
+            captured["provider"] = provider
             return None
 
         with patch.object(main, "generate_codex_provider_image_via_gpt_image_2_skill", fake_skill):
             with self.assertRaises(main.HTTPException):
                 await main.generate_codex_provider_image("prompt", "1024x1024", "gpt-image-2", reference_images=[], image_model="gpt-image-2.5-sunburst")
         self.assertEqual(captured["image_model"], "gpt-image-2.5-sunburst")
+
+
+class CodexApiFallbackTests(unittest.TestCase):
+    def _attempts(self, provider_cfg, auth_data):
+        with patch.object(main, "gpt_image_2_skill_auth_json", return_value=auth_data), patch.object(
+            main, "gpt_image_2_skill_provider_args", return_value=(["--provider", "codex"], "codex")
+        ), patch.object(main, "gpt_image_2_skill_api_key", return_value=str(auth_data.get("OPENAI_API_KEY") or "")):
+            return main.codex_image_skill_attempts(provider_cfg, "auth.json")
+
+    def test_fallback_disabled_by_default_even_with_key(self):
+        attempts = self._attempts({"id": "codex", "protocol": "codex"}, {"tokens": {}, "OPENAI_API_KEY": "sk-test"})
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0][1], "codex")
+
+    def test_fallback_enabled_by_switch_adds_openai_attempt(self):
+        attempts = self._attempts(
+            {"id": "codex", "protocol": "codex", "allow_api_fallback": True},
+            {"tokens": {}, "OPENAI_API_KEY": "sk-test"},
+        )
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0][1], "codex")
+        self.assertEqual(attempts[1][1], "openai")
+        self.assertIn("--api-key", attempts[1][0])
+        self.assertIn("sk-test", attempts[1][0])
+
+    def test_fallback_switch_on_without_key_stays_single_attempt(self):
+        attempts = self._attempts({"id": "codex", "protocol": "codex", "allow_api_fallback": True}, {"tokens": {}})
+        self.assertEqual(len(attempts), 1)
+
+    def test_fallback_requires_codex_provider_resolution(self):
+        with patch.object(main, "gpt_image_2_skill_auth_json", return_value={"OPENAI_API_KEY": "sk-test"}), patch.object(
+            main, "gpt_image_2_skill_provider_args", return_value=(["--provider", "openai", "--api-key", "sk-test"], "openai")
+        ), patch.object(main, "gpt_image_2_skill_api_key", return_value="sk-test"):
+            attempts = main.codex_image_skill_attempts({"allow_api_fallback": True}, "auth.json")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0][1], "openai")
 
 
 if __name__ == "__main__":

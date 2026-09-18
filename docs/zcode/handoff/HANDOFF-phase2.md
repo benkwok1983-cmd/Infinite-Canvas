@@ -39,7 +39,7 @@ run.bat   # 或 .\python\python.exe main.py（端口 3000）
 
 - **Codex 通道原理**：走 gpt-image-2-skill CLI（本机 0.7.3）＋ `~/.codex/auth.json`，不是 codex CLI 生图本身；`--model` 是宿主模型，图片模型由服务端定；本机 config.toml 宿主 = `gpt-5.6-sol`。
 - **诚实反馈口径**：服务端可能返回别名 `gpt-image-2-codex`（不确认 2.5）；观察模型只采信 `response.completed` 事件。
-- **已删除 API 回退**：Codex 401 直报并提示重新登录（FR1-6，用户明确要求不产生 API 费用）。
+- **已删除 API 回退**→**修订（用户澄清）**：auto 档回退恢复为 provider 级 UI 开关 `allow_api_fallback`（API 设置页 Codex 卡片，默认关）；**2.5 实验档严格只走订阅，无任何回退**。相关：`codex_image_skill_attempts`（main.py）、`ApiProviderPayload.allow_api_fallback`、api-settings.html codexCliPanel 内 toggle。
 - **审查遗留 P2**（随 T1.2 处理）：lastImageModelMeta 溯源面板接线、401-不回退守护测试、experimental_image_models 后端字段前端消费、smart.imageModelObserved 词条使用。
 - **浏览器实测限制**：composer 隐藏态 + touch-mouse.js 自定义指针 → Playwright 合成点击超时；用 evaluate 调渲染函数验证输出替代。
 

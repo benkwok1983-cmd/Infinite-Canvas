@@ -1322,6 +1322,7 @@ def normalize_provider(item):
         "rh_workflows": normalize_runninghub_entries(item.get("rh_workflows") or [], "workflow"),
         "volcengine_project_name": volc_project,
         "volcengine_region": volc_region,
+        "allow_api_fallback": bool(item.get("allow_api_fallback", False)),
     }
 
 def load_api_providers():
@@ -2950,6 +2951,7 @@ class ApiProviderPayload(BaseModel):
     volcengine_region: str = VOLCENGINE_DEFAULT_REGION
     volcengine_access_key_id: Optional[str] = None
     volcengine_secret_access_key: Optional[str] = None
+    allow_api_fallback: bool = False
     api_key: Optional[str] = None
     wallet_api_key: Optional[str] = None
     clear_key: bool = False
@@ -5523,7 +5525,26 @@ async def generate_codex_image_via_request_create(prompt, size, model, exe, tool
         "raw": parsed or {"stdout": out_text, "stderr": err_text},
     }
 
-async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths=None, image_model=""):
+def codex_image_skill_attempts(provider=None, auth_file=""):
+    """构造 images generate 的尝试序列（auto/latest 档）。
+
+    Codex 订阅通道优先；仅当 provider 开关 allow_api_fallback 打开且能找到 API key 时，
+    追加 OpenAI API 通道回退（Codex 401 时启用，出图按 API 计费）。默认不回退。
+    实验性 2.5 档（request create 路径）不经过本函数，严格只走订阅额度。
+    """
+    auth_data = gpt_image_2_skill_auth_json(auth_file)
+    provider_args, tool_provider = gpt_image_2_skill_provider_args(auth_file)
+    attempts = [(provider_args, tool_provider)]
+    fallback_enabled = bool(
+        provider
+        and (provider.get("allow_api_fallback") or provider.get("codex_allow_api_fallback"))
+    )
+    fallback_api_key = gpt_image_2_skill_api_key(auth_data)
+    if tool_provider == "codex" and fallback_enabled and fallback_api_key:
+        attempts.append((["--provider", "openai", "--api-key", fallback_api_key], "openai"))
+    return attempts
+
+async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths=None, image_model="", provider=None):
     exe = gpt_image_2_skill_executable()
     if not exe:
         return None
@@ -5534,89 +5555,94 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             raise HTTPException(status_code=400, detail="实验性 Image 2.5 目前仅支持文生图（Codex 通道不支持参考图编辑）。请移除参考图，或改用 auto/latest 档位。")
         return await generate_codex_image_via_request_create(prompt, size, model, exe, tool_model)
     auth_file = gpt_image_2_skill_auth_file()
-    auth_data = gpt_image_2_skill_auth_json(auth_file)
-    provider_args, tool_provider = gpt_image_2_skill_provider_args(auth_file)
-    out_path = os.path.join(OUTPUT_OUTPUT_DIR, f"gpt_image_2_{uuid.uuid4().hex}.png")
-    mode = "edit" if ref_paths else "generate"
-    args = [
-        exe,
-        "--json",
-    ]
-    args.extend(provider_args)
-    args.extend([
-        "images",
-        mode,
-        "--prompt",
-        gpt_image_2_skill_prompt_arg(prompt, size, tool_provider),
-        "--out",
-        out_path,
-        "--model",
-        gpt_image_2_skill_model_arg(model, tool_provider),
-        "--format",
-        "png",
-        "--size",
-        gpt_image_2_skill_size_arg(size, model, prompt, tool_provider),
-        "--quality",
-        "high",
-    ])
-    for path in ref_paths:
-        args.extend(["--ref-image", path])
-    if ref_paths and tool_provider == "openai":
-        args.extend(["--input-fidelity", "high"])
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=BASE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=codex_timeout())
-    except asyncio.TimeoutError as exc:
+    attempts = codex_image_skill_attempts(provider, auth_file)
+    last_message = ""
+    for attempt_index, (attempt_provider_args, attempt_provider) in enumerate(attempts):
+        out_path = os.path.join(OUTPUT_OUTPUT_DIR, f"gpt_image_2_{uuid.uuid4().hex}.png")
+        mode = "edit" if ref_paths else "generate"
+        args = [
+            exe,
+            "--json",
+        ]
+        args.extend(attempt_provider_args)
+        args.extend([
+            "images",
+            mode,
+            "--prompt",
+            gpt_image_2_skill_prompt_arg(prompt, size, attempt_provider),
+            "--out",
+            out_path,
+            "--model",
+            gpt_image_2_skill_model_arg(model, attempt_provider),
+            "--format",
+            "png",
+            "--size",
+            gpt_image_2_skill_size_arg(size, model, prompt, attempt_provider),
+            "--quality",
+            "high",
+        ])
+        for path in ref_paths:
+            args.extend(["--ref-image", path])
+        if ref_paths and attempt_provider == "openai":
+            args.extend(["--input-fidelity", "high"])
         try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
-        raise HTTPException(status_code=504, detail="GPT Image 2 Skill 执行超时。可设置 CODEX_CLI_TIMEOUT 增大等待时间。") from exc
-    except FileNotFoundError:
-        return None
-    out_text, err_text = codex_decode_output(stdout, stderr)
-    if proc.returncode != 0:
-        message = gpt_image_2_skill_failure_message(out_text, err_text, proc.returncode)
-        auth_failed = bool(re.search(r"\b401\b|unauthori[sz]ed|access[_ -]?token|api[_ -]?key", message, re.I))
-        if tool_provider == "codex" and auth_failed:
-            detail = "Codex 登录凭据无效或已过期，请重新运行 codex 登录后重试。"
-            if message:
-                detail += f" 服务端消息：{message[:800]}"
-            raise HTTPException(status_code=401, detail=detail)
-        raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 调用失败：{message[:1200]}")
-    parsed, reported_paths = parse_gpt_image_2_skill_output(out_text, err_text)
-    candidate_paths = []
-    if os.path.isfile(out_path):
-        candidate_paths.append(out_path)
-    candidate_paths.extend([path for path in reported_paths if path and os.path.isfile(path)])
-    urls = []
-    image_size = codex_image_dimensions(candidate_paths[0]) if candidate_paths else None
-    for path in candidate_paths:
-        processed_path = codex_postprocess_image_to_requested_size(path, size, tool_provider)
-        url = codex_output_url_from_path(processed_path or path)
-        if url:
-            urls.append(url)
-    if not urls:
-        status_text = (out_text or err_text or "")[:1200]
-        raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 已返回，但没有在输出目录发现图片：{status_text}")
-    return {"type": "url", "value": urls[0]}, {
-        "images": urls,
-        "text": out_text,
-        "provider": "codex",
-        "tool": "gpt-image-2-skill",
-        "tool_provider": tool_provider,
-        "image_model_requested": "auto/latest",
-        "image_model_observed": "",
-        "image_model_confirmed": False,
-        "image_size": image_size,
-        "raw": parsed or {"stdout": out_text, "stderr": err_text},
-    }
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=BASE_DIR,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=codex_timeout())
+        except asyncio.TimeoutError as exc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            raise HTTPException(status_code=504, detail="GPT Image 2 Skill 执行超时。可设置 CODEX_CLI_TIMEOUT 增大等待时间。") from exc
+        except FileNotFoundError:
+            return None
+        out_text, err_text = codex_decode_output(stdout, stderr)
+        if proc.returncode != 0:
+            message = gpt_image_2_skill_failure_message(out_text, err_text, proc.returncode)
+            last_message = f"{attempt_provider}: {message}"
+            auth_failed = bool(re.search(r"\b401\b|unauthori[sz]ed|access[_ -]?token|api[_ -]?key", message, re.I))
+            if attempt_provider == "codex" and attempt_index + 1 < len(attempts) and auth_failed:
+                continue
+            if attempt_provider == "codex" and auth_failed:
+                detail = "Codex 登录凭据无效或已过期，请重新运行 codex 登录后重试。"
+                if message:
+                    detail += f" 服务端消息：{message[:800]}"
+                raise HTTPException(status_code=401, detail=detail)
+            raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 调用失败：{last_message[:1200]}")
+        parsed, reported_paths = parse_gpt_image_2_skill_output(out_text, err_text)
+        candidate_paths = []
+        if os.path.isfile(out_path):
+            candidate_paths.append(out_path)
+        candidate_paths.extend([path for path in reported_paths if path and os.path.isfile(path)])
+        urls = []
+        image_size = codex_image_dimensions(candidate_paths[0]) if candidate_paths else None
+        for path in candidate_paths:
+            processed_path = codex_postprocess_image_to_requested_size(path, size, attempt_provider)
+            url = codex_output_url_from_path(processed_path or path)
+            if url:
+                urls.append(url)
+        if not urls:
+            status_text = (out_text or err_text or "")[:1200]
+            raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 已返回，但没有在输出目录发现图片：{status_text}")
+        return {"type": "url", "value": urls[0]}, {
+            "images": urls,
+            "text": out_text,
+            "provider": "codex",
+            "tool": "gpt-image-2-skill",
+            "tool_provider": attempt_provider,
+            "image_model_requested": "auto/latest",
+            "image_model_observed": "",
+            "image_model_confirmed": False,
+            "image_size": image_size,
+            "raw": parsed or {"stdout": out_text, "stderr": err_text},
+        }
+    raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 调用失败：{last_message[:1200]}")
 
 async def codex_prepare_local_media(ref_url):
     text = str(ref_url or "").strip()
@@ -5702,7 +5728,7 @@ def codex_models_payload(raw=None):
 async def generate_codex_provider_image(prompt, size, model, reference_images=None, provider=None, image_model=""):
     ref_paths, temp_paths = await codex_reference_paths(reference_images)
     try:
-        skill_result = await generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths, image_model)
+        skill_result = await generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths, image_model, provider)
         if skill_result:
             return skill_result
         raise HTTPException(status_code=400, detail="未找到 GPT Image 2 helper，OpenAI CLI 生图已禁用 $imagegen 回退。请先安装 gpt-image-2-skill 后再生成图片。")
