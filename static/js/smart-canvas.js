@@ -2549,8 +2549,9 @@ const JIMENG_VIDEO_MODELS_BY_COMMAND = {
 function jimengVideoCommand(){
     const node = activeComposerNode() || selectedNode();
     const refs = node ? visibleReferenceImagesFor(node) : [];
-    const imageRefs = imageRefsOnly(refs);
-    const hasVideoRef = videoRefsOnly(refs).length > 0 || Boolean(manualSmartVideoLink(settings));
+    const effectiveRefs = applyUploadedUrlsToSmartRefs(refs, settings);
+    const imageRefs = imageRefsOnly(effectiveRefs);
+    const hasVideoRef = videoRefsOnly(effectiveRefs).length > 0;
     if(settings.videoMultimodal || hasVideoRef) return 'multimodal2video';
     if(imageRefs.length >= 2) return settings.videoUseFrameRoles ? 'frames2video' : 'multiframe2video';
     if(imageRefs.length >= 1) return 'image2video';
@@ -16389,8 +16390,9 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
             }
             return item;
         });
-        const manualVideo = manualSmartVideoLink(runSettings)?.url || '';
-        const refVideos = manualVideo ? manualSmartMediaLinks(runSettings).map(item => item.url).filter(Boolean) : videoRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean);
+        // 云端上传/手动链接只替换素材 URL，不能改变原引用的媒体类型。
+        // 否则图片的云端 URL 会被无条件塞进 videos，导致 APIMart 把 PNG 当参考视频解析。
+        const refVideos = videoRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean);
         const refAudios = audioRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean).slice(0, 3);
         if(mismatchedAsset) toast('部分认证素材属于其它平台，已回退为普通素材。切换到对应平台的视频接口才能用 asset:// 认证地址。');
         const payload = {

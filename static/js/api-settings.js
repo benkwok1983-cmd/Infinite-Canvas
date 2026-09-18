@@ -154,42 +154,6 @@ let providerDragId = '';
 // category: 'allround'（全能）| 'value'（性价比）| 'free'（免费），推荐面板按分组分节展示
 const RECOMMENDED_APIS = [
     {
-        id:'tudou',
-        name:'土豆API',
-        category:'value',
-        base_url:'https://api.ai-tudou.net',
-        protocol:'openai',
-        image_request_mode:'tudou-async',
-        register_url:'https://api.ai-tudou.net/register?aff=GmBu',
-        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
-        icons:['IMG','VID','LLM'],
-        summaryKey:'api.recommendTudouSummary',
-        advantages:['支持 LLM、图像和视频模型', 'Grok 图像专属图生图协议', '异步视频模型已预设'],
-        image_models:['gpt-image-2-1k', 'gpt-image-2-2k', 'gpt-image-2-4k', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview', 'grok-imagine-image', 'grok-imagine-image-pro', 'grok-imagine-image-edit'],
-        chat_models:['gpt-5.5'],
-        video_models:['grok-imagine-video', 'grok-imagine-video-1.5', 'sora2', 'veo3.1', 'kling-v3', 'pixverse-v6', 'seedance-2.0-fast'],
-        model_protocols:{'gemini-3.1-flash-image-preview':'gemini', 'gemini-3-pro-image-preview':'gemini'}
-    },
-    {
-        id:'exellome',
-        name:'EXELLOME',
-        category:'value',
-        base_url:'https://new.exellome.online',
-        // 异步协议 + 异步生图模式：提交 /v1/videos、轮询 /v1/videos/{id}，本地参考图走 multipart 直传
-        protocol:'apimart',
-        image_request_mode:'openai-video-proxy',
-        register_url:'https://new.exellome.online/register?aff=r2dZ',
-        tagKeys:['GPT-Image2','Nano-Banana'],
-        icons:['IMG'],
-        summaryKey:'api.recommendExellomeSummary',
-        perks:[{key:'api.recommendExellome2k4k'}],
-        keyHint:'使用 VIP 分组',
-        advantages:['稳定输出 GPT-Image2 和 Nano Banana 的 2K/4K', '异步协议适合长任务', '预填全系图像模型'],
-        image_models:['gpt-image2-2k', 'gpt-image2-4k', 'Nano-Banana-2-2k', 'Nano-Banana-2-4k', 'Nano-Banana-Pro-2k', 'Nano-Banana-Pro-4k'],
-        chat_models:[],
-        video_models:[]
-    },
-    {
         id:'fhl',
         name:'FHL',
         category:'value',
@@ -205,19 +169,6 @@ const RECOMMENDED_APIS = [
         image_models:['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k', 'nano-banana'],
         chat_models:['gpt-5.5'],
         video_models:[]
-    },
-    {
-        id:'vip-gpt',
-        name:'VIP-GPT',
-        category:'value',
-        base_url:VIP_GPT_DEFAULT_BASE_URL,
-        protocol:'openai',
-        register_url:VIP_GPT_REGISTER_URL,
-        tagKeys:['Codex','Claude','GPT-image-2','Nano-banana'],
-        icons:['GPT','LLM'],
-        summaryKey:'api.recommendVipGptSummary',
-        advantages:['OpenAI 兼容接入', '预填官方请求地址', '保存 Key 后可拉取模型'],
-        empty_models_on_save:true
     },
     {
         id:'runninghub',
@@ -300,7 +251,9 @@ const RECOMMEND_GROUPS = [
     {key:'value', titleKey:'api.recommendGroupValue', icon:'badge-percent'},
     {key:'free', titleKey:'api.recommendGroupFree', icon:'gift'}
 ];
-const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['exellome', 'fhl']);
+// Exellome keeps APIMart as its recommended default, but users may switch the
+// provider to another compatible protocol when the upstream configuration changes.
+const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['fhl']);
 function lockedRecommendedApi(itemOrId){
     const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
     const name = typeof itemOrId === 'string' ? '' : itemOrId?.name;
