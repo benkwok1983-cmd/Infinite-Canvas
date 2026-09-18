@@ -237,6 +237,78 @@ class SkillsApiTests(unittest.TestCase):
         resp = self.client.post("/api/skills/custom", json={"name": "!!!"})
         self.assertEqual(resp.status_code, 400)
 
+    def test_create_frontmatter_injection_is_neutralized(self):
+        resp = self.client.post("/api/skills/custom", json={
+            "name": "injection-test",
+            "description": "d1\nversion: 9.9\nname: hacked",
+        })
+        self.assertEqual(resp.status_code, 200)
+        md = (Path(self.custom_dir) / "injection-test" / "SKILL.md").read_text(encoding="utf-8")
+        fm, _body = main.parse_skill_markdown_text(md)
+        self.assertEqual(fm.get("name"), "injection-test")
+        self.assertNotEqual(str(fm.get("version")), "9.9")
+        self.assertIn("hacked", str(fm.get("description")))
+
+    def test_check_update_and_upgrade_reject_non_github(self):
+        created = self.client.post("/api/skills/custom", json={"name": "local-only"})
+        self.assertEqual(created.status_code, 200)
+        check = self.client.get("/api/skills/custom/local-only/check-update")
+        self.assertEqual(check.status_code, 400)
+        self.assertIn("GitHub", check.json()["detail"])
+        upgrade = self.client.post("/api/skills/custom/local-only/upgrade", json={})
+        self.assertEqual(upgrade.status_code, 400)
+
+    def test_zip_install_409_then_overwrite(self):
+        def zip_bytes():
+            import io as _io
+            buf = _io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as archive:
+                archive.writestr("packaged/SKILL.md", "---\nname: zip-skill\n---\nfrom zip\n")
+            return buf.getvalue()
+        first = self.client.post("/api/skills/zip/install", files={"file": ("s.zip", zip_bytes(), "application/zip")})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["id"], "zip-skill")
+        self.assertIn("from zip", (Path(self.custom_dir) / "zip-skill" / "SKILL.md").read_text(encoding="utf-8"))
+        dup = self.client.post("/api/skills/zip/install", files={"file": ("s.zip", zip_bytes(), "application/zip")})
+        self.assertEqual(dup.status_code, 409)
+        over = self.client.post(
+            "/api/skills/zip/install",
+            files={"file": ("s.zip", zip_bytes(), "application/zip")},
+            data={"overwrite": "true"},
+        )
+        self.assertEqual(over.status_code, 200)
+        cleanup = self.client.delete("/api/skills/custom/zip-skill")
+        self.assertEqual(cleanup.status_code, 200)
+
+    def test_yaml_alias_bomb_is_neutralized(self):
+        bomb = "a: &a [" + ",".join(["*a"] * 50) + "]\n" + "b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a,*a]\n"
+        text = f"---\n{bomb}---\nBody"
+        # 应快速返回（回退或截断），不得挂起或抛出
+        fm, body = main.parse_skill_markdown_text(text)
+        self.assertIn("Body", body)
+
+
+class SkillLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_safe_extract_file_count_limit(self):
+        entries = [(f"packaged/f{i}.txt", "x") for i in range(main.SKILLS_MAX_FILES + 2)]
+        entries.insert(0, ("packaged/SKILL.md", "x"))
+        zip_path = os.path.join(self.root, "many.zip")
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            for filename, data in entries:
+                archive.writestr(filename, data)
+        dest = os.path.join(self.root, "outmany")
+        os.makedirs(dest)
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.safe_extract_skill_zip(zip_path, dest)
+        self.assertEqual(ctx.exception.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

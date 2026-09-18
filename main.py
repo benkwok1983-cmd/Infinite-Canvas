@@ -19364,31 +19364,51 @@ def skill_dir_for(source, skill_id):
     if not root:
         raise HTTPException(status_code=400, detail=f"未知的 Skill 来源：{source}")
     safe_id = str(skill_id or "").strip()
+    if "\0" in safe_id or ":" in safe_id or ".." in safe_id.replace("\\", "/").split("/") or safe_id.startswith("."):
+        raise HTTPException(status_code=400, detail="Skill 路径不合法")
     if source == "custom" and not SKILL_ID_RE.match(safe_id):
         raise HTTPException(status_code=400, detail=f"Skill ID 不合法：{safe_id[:60]}")
     target = os.path.realpath(os.path.join(root, safe_id))
-    if os.path.commonpath([root, target]) != root or os.path.basename(target) != safe_id:
+    try:
+        inside = os.path.commonpath([root, target]) == root
+    except ValueError:
+        inside = False
+    if not inside or os.path.basename(target) != safe_id:
         raise HTTPException(status_code=400, detail="Skill 路径不合法")
     if not os.path.isdir(target):
         raise HTTPException(status_code=404, detail=f"Skill 不存在：{source}/{safe_id}")
     return target
 
+def _guarded_yaml_load(text, alias_limit=1000):
+    """带复杂度上限的 yaml 解析：防第三方 SKILL.md frontmatter 的 alias 炸弹 DoS。"""
+    if _skill_yaml is None:
+        return None
+    counter = {"nodes": 0}
+
+    class GuardedLoader(_skill_yaml.SafeLoader):
+        def compose_node(self, parent, index):
+            counter["nodes"] += 1
+            if counter["nodes"] > alias_limit:
+                raise _skill_yaml.YAMLError("yaml complexity limit exceeded")
+            return super().compose_node(parent, index)
+
+    try:
+        return _skill_yaml.load(text, Loader=GuardedLoader)
+    except Exception:
+        return None
+
 def parse_skill_markdown_text(text):
-    """解析 SKILL.md：YAML frontmatter + 正文。yaml 缺失时回退 flat key: value 解析。"""
+    """解析 SKILL.md：YAML frontmatter + 正文。yaml 缺失/超限/畸形时回退 flat key: value 解析。"""
     text = str(text or "").lstrip("\ufeff")
     match = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", text, flags=re.S)
     if not match:
         return {}, text
     fm_text, body = match.group(1), text[match.end():]
     data = {}
-    if _skill_yaml is not None:
-        try:
-            loaded = _skill_yaml.safe_load(fm_text)
-            if isinstance(loaded, dict):
-                data = {str(key): value for key, value in loaded.items()}
-                return data, body
-        except Exception:
-            pass
+    loaded = _guarded_yaml_load(fm_text)
+    if isinstance(loaded, dict):
+        data = {str(key): value for key, value in loaded.items()}
+        return data, body
     for raw in fm_text.splitlines():
         m = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", raw.strip())
         if m:
@@ -19408,8 +19428,9 @@ def skill_write_meta(dir_path, meta):
     try:
         with open(os.path.join(dir_path, SKILL_META_FILE), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
+        return True
     except Exception:
-        pass
+        return False
 
 def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
     """扫描一个 skill 目录并组装元数据条目；缺少 SKILL.md 时也返回（标记 has_skill_md=False 供前端提示）。"""
@@ -19424,9 +19445,9 @@ def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
         try:
             with open(skill_md, "r", encoding="utf-8", errors="replace") as f:
                 fm, body = parse_skill_markdown_text(f.read())
-            name = str(fm.get("name") or skill_id)
-            description = str(fm.get("description") or "").strip()
-            version = str(fm.get("version") or "").strip()
+            name = str(fm.get("name") or skill_id)[:200]
+            description = str(fm.get("description") or "").strip()[:300]
+            version = str(fm.get("version") or "").strip()[:60]
             license_text = fm.get("license") or fm.get("licenses")
             license_text = "" if isinstance(license_text, (dict, list)) else str(license_text or "").strip()
             license = license_text[:120]
@@ -19560,10 +19581,18 @@ async def api_skill_create(payload: SkillCreateRequest):
     target = os.path.join(skill_source_root("custom"), skill_id)
     if os.path.exists(target):
         raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}")
+    def _clean(value):
+        return re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    name_clean = _clean(payload.name)[:100]
+    desc_clean = _clean(payload.description)[:400]
+    if _skill_yaml is not None:
+        fm_body = _skill_yaml.safe_dump({"name": name_clean, "description": desc_clean, "version": "0.1.0"}, allow_unicode=True, sort_keys=False)
+    else:
+        esc = lambda v: v.replace("\\", "\\\\").replace('"', '\\"')
+        fm_body = f'name: "{esc(name_clean)}"\ndescription: "{esc(desc_clean)}"\nversion: "0.1.0"\n'
     try:
         os.makedirs(target, exist_ok=True)
-        frontmatter = f"---\nname: {payload.name.strip()}\ndescription: {payload.description.strip()}\nversion: 0.1.0\n---\n\n"
-        content = frontmatter + (payload.content.strip() + "\n" if payload.content.strip() else "# 在此编写该风格的使用指令（供生图改写流程读取）\n")
+        content = f"---\n{fm_body}---\n\n" + (payload.content.strip() + "\n" if payload.content.strip() else "# 在此编写该风格的使用指令（供生图改写流程读取）\n")
         with open(os.path.join(target, "SKILL.md"), "w", encoding="utf-8") as f:
             f.write(content)
         skill_write_meta(target, {"source": "local", "installed_at": now_ms(), "updated_at": now_ms()})
@@ -19614,7 +19643,7 @@ class SkillUpgradeRequest(BaseModel):
 def github_repo_slug(url):
     """从 GitHub URL 提取 (owner, repo, ref)。支持 /tree/{ref} 与 .git 后缀。"""
     text = str(url or "").strip()
-    match = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/tree/([^/?#]+))?/?$", text)
+    match = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/tree/([^/?#]+))?/?$", text, flags=re.I)
     if not match:
         return "", "", ""
     owner, repo, ref = match.group(1), match.group(2), (match.group(3) or "").strip()
@@ -19627,46 +19656,78 @@ def github_api_headers():
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-async def github_download_repo_zip(url, sha_or_ref=""):
-    """下载仓库 zipball 到临时文件，返回 (temp_zip_path, slug_info)。"""
+async def github_resolve_commit(url, ref=""):
+    """只调 commits API 解析可执行的完整 SHA（check-update 用，避免白拉整个 zipball）。"""
     owner, repo, ref_from_url = github_repo_slug(url)
     if not owner or not repo:
         raise HTTPException(status_code=400, detail="URL 需要是 https://github.com/{owner}/{repo} 形式的仓库地址")
-    branch = str(sha_or_ref or "").strip() or ref_from_url
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0), follow_redirects=True) as client:
+    branch = str(ref or "").strip() or ref_from_url
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0), follow_redirects=True) as client:
         try:
-            if branch:
-                commit_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}", headers=github_api_headers())
-                commit_resp.raise_for_status()
-                commit_data = commit_resp.json()
-                sha = str(commit_data.get("sha") or "")
-                commit_message = str((commit_data.get("commit") or {}).get("message") or "").splitlines()[0][:200]
-            else:
+            if not branch:
                 repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=github_api_headers())
                 repo_resp.raise_for_status()
-                repo_data = repo_resp.json()
-                branch = str(repo_data.get("default_branch") or "main")
-                commit_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}", headers=github_api_headers())
-                commit_resp.raise_for_status()
-                commit_data = commit_resp.json()
-                sha = str(commit_data.get("sha") or "")
-                commit_message = str((commit_data.get("commit") or {}).get("message") or "").splitlines()[0][:200]
-            if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
-                raise HTTPException(status_code=502, detail=f"GitHub 返回的提交 SHA 异常：{sha[:60]}")
-            zip_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/zipball/{sha}", headers=github_api_headers())
-            zip_resp.raise_for_status()
+                branch = str((repo_resp.json() or {}).get("default_branch") or "main")
+            commit_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}", headers=github_api_headers())
+            commit_resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             detail = "GitHub 仓库不存在或不可访问" if status == 404 else ("GitHub API 限流，稍后再试或配置 GITHUB_TOKEN" if status in (403, 429) else f"GitHub 请求失败：HTTP {status}")
             raise HTTPException(status_code=502, detail=detail) from exc
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"GitHub 网络请求失败：{exc}") from exc
-        if len(zip_resp.content) > SKILLS_ZIP_MAX_BYTES:
+        data = commit_resp.json() or {}
+        sha = str(data.get("sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+            raise HTTPException(status_code=502, detail=f"GitHub 返回的提交 SHA 异常：{sha[:60]}")
+        message_lines = str((data.get("commit") or {}).get("message") or "").splitlines() or [""]
+        return {"owner": owner, "repo": repo, "ref": branch, "sha": sha, "commit_message": message_lines[0][:200]}
+
+async def github_download_repo_zip(url, sha_or_ref=""):
+    """解析提交并流式下载 zipball（边下边限长），返回 (temp_zip_path, info)。"""
+    owner, repo, ref_from_url = github_repo_slug(url)
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="URL 需要是 https://github.com/{owner}/{repo} 形式的仓库地址")
+    branch = str(sha_or_ref or "").strip() or ref_from_url
+    if branch and re.fullmatch(r"[0-9a-fA-F]{7,64}", branch):
+        branch = branch.lower()
+    info = await github_resolve_commit(url, branch)
+    fd, temp_zip = tempfile.mkstemp(prefix="skill_repo_", suffix=".zip")
+    downloaded = 0
+    over_limit = False
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0), follow_redirects=True) as client:
+            try:
+                async with client.stream("GET", f"https://api.github.com/repos/{owner}/{repo}/zipball/{info['sha']}", headers=github_api_headers()) as zip_resp:
+                    zip_resp.raise_for_status()
+                    with os.fdopen(fd, "wb") as f:
+                        fd = None
+                        async for chunk in zip_resp.aiter_bytes(1 << 16):
+                            downloaded += len(chunk)
+                            if downloaded > SKILLS_ZIP_MAX_BYTES:
+                                over_limit = True
+                                break
+                            f.write(chunk)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                detail = "GitHub 仓库不存在或不可访问" if status == 404 else ("GitHub API 限流，稍后再试或配置 GITHUB_TOKEN" if status in (403, 429) else f"GitHub 请求失败：HTTP {status}")
+                raise HTTPException(status_code=502, detail=detail) from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail=f"GitHub 网络请求失败：{exc}") from exc
+        if over_limit:
             raise HTTPException(status_code=400, detail=f"仓库压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
-        fd, temp_zip = tempfile.mkstemp(prefix="skill_repo_", suffix=".zip")
-        with os.fdopen(fd, "wb") as f:
-            f.write(zip_resp.content)
-    return temp_zip, {"owner": owner, "repo": repo, "ref": branch, "sha": sha, "commit_message": commit_message}
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if over_limit:
+            try:
+                os.remove(temp_zip)
+            except OSError:
+                pass
+    return temp_zip, info
 
 def safe_extract_skill_zip(zip_path, dest_root):
     """解压 zip 到 dest_root，带 zip-slip/大小/数量防护。返回解压根目录（zip 内唯一顶层目录）。"""
@@ -19688,6 +19749,8 @@ def safe_extract_skill_zip(zip_path, dest_root):
                     raise HTTPException(status_code=400, detail=f"压缩包含非法路径：{info.filename[:80]}")
                 file_count += 1
                 total_bytes += info.file_size
+                if info.file_size > SKILLS_MAX_FILE_BYTES:
+                    raise HTTPException(status_code=400, detail=f"压缩包内单文件超过 {SKILLS_MAX_FILE_BYTES // (1024*1024)}MB 上限：{info.filename[:80]}")
                 if file_count > SKILLS_MAX_FILES:
                     raise HTTPException(status_code=400, detail=f"文件数超过 {SKILLS_MAX_FILES} 上限")
                 if total_bytes > SKILLS_MAX_TOTAL_BYTES:
@@ -19747,7 +19810,12 @@ async def api_skill_github_preview(payload: SkillGithubPreviewRequest):
             skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
-            entry["id"] = normalize_skill_id(payload.name or os.path.basename(skill_root.rstrip("/\\"))) or entry["name"]
+            entry["id"] = (
+                normalize_skill_id(payload.name)
+                or normalize_skill_id(str(entry.get("name") or ""))
+                or normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
+                or entry["name"]
+            )
             return {
                 "ok": True,
                 "repo": info,
@@ -19763,7 +19831,7 @@ async def api_skill_github_preview(payload: SkillGithubPreviewRequest):
 
 @app.post("/api/skills/github/install")
 async def api_skill_github_install(payload: SkillGithubInstallRequest):
-    if not re.fullmatch(r"[0-9a-f]{7,64}", str(payload.sha or "")):
+    if not re.fullmatch(r"[0-9a-f]{7,64}", str(payload.sha or "").lower()):
         raise HTTPException(status_code=400, detail="SHA 格式不合法")
     skill_id = normalize_skill_id(payload.name)
     temp_zip, info = await github_download_repo_zip(payload.url, payload.sha)
@@ -19801,13 +19869,26 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
             pass
 
 @app.post("/api/skills/zip/install")
-async def api_skill_zip_install(file: UploadFile = File(...)):
-    content = await file.read()
-    if len(content) > SKILLS_ZIP_MAX_BYTES:
-        raise HTTPException(status_code=400, detail=f"压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
+async def api_skill_zip_install(file: UploadFile = File(...), overwrite: bool = Form(False)):
     fd, temp_zip = tempfile.mkstemp(prefix="skill_zip_", suffix=".zip")
+    total_uploaded = 0
+    over_limit = False
     with os.fdopen(fd, "wb") as f:
-        f.write(content)
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            total_uploaded += len(chunk)
+            if total_uploaded > SKILLS_ZIP_MAX_BYTES:
+                over_limit = True
+                break
+            f.write(chunk)
+    if over_limit:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=f"压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
     try:
         with tempfile.TemporaryDirectory(prefix="skill_zip_install_") as temp_dir:
             extracted = os.path.join(temp_dir, "x")
@@ -19821,10 +19902,15 @@ async def api_skill_zip_install(file: UploadFile = File(...)):
                 raise HTTPException(status_code=400, detail=f"从 SKILL.md 推导的 ID 不合法：{skill_id[:60]}")
             target = os.path.join(skill_source_root("custom"), skill_id)
             if os.path.exists(target):
+                if not overwrite:
+                    raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
                 shutil.rmtree(target)
             shutil.move(staged, target)
-            skill_write_meta(target, {"source": "zip", "installed_at": now_ms()})
-            return {"ok": True, "id": skill_id, "skill": skill_entry_from_dir(target, "custom")}
+            meta_written = skill_write_meta(target, {"source": "zip", "installed_at": now_ms()})
+            result = {"ok": True, "id": skill_id, "skill": skill_entry_from_dir(target, "custom")}
+            if not meta_written:
+                result["warnings"] = ["安装元数据写入失败，不影响使用"]
+            return result
     finally:
         try:
             os.remove(temp_zip)
@@ -19839,17 +19925,13 @@ async def api_skill_check_update(skill_id: str):
     if meta.get("source") != "github" or not repo_url:
         raise HTTPException(status_code=400, detail="该 Skill 不是 GitHub 来源，无法检查更新")
     current_sha = str(meta.get("commit_sha") or "")
-    temp_zip, info = await github_download_repo_zip(repo_url, str(meta.get("ref") or ""))
-    try:
-        os.remove(temp_zip)
-    except OSError:
-        pass
+    info = await github_resolve_commit(repo_url, str(meta.get("ref") or ""))
     latest_sha = info.get("sha") or ""
     return {
         "ok": True,
         "current_sha": current_sha,
         "latest_sha": latest_sha,
-        "up_to_date": bool(current_sha and current_sha == latest_sha),
+        "up_to_date": bool(current_sha and current_sha.lower() == latest_sha.lower()),
         "latest_commit_message": info.get("commit_message") or "",
         "repo_url": repo_url,
     }
@@ -19861,7 +19943,7 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
     repo_url = str(meta.get("repo_url") or "")
     if meta.get("source") != "github" or not repo_url:
         raise HTTPException(status_code=400, detail="该 Skill 不是 GitHub 来源，无法升级")
-    temp_zip, info = await github_download_repo_zip(repo_url, str(payload.sha or meta.get("ref") or ""))
+    temp_zip, info = await github_download_repo_zip(repo_url, str(payload.sha or meta.get("ref") or "").lower())
     try:
         with tempfile.TemporaryDirectory(prefix="skill_upgrade_") as temp_dir:
             extracted = os.path.join(temp_dir, "x")
@@ -19870,27 +19952,40 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
             skill_root, skill_rel = locate_skill_root(extracted_root, str(meta.get("skill_root") or ""))
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
-            backup = dir_path + ".upgrade-bak"
+            # 备份目录用点前缀：skill_scan_all 跳过隐藏目录，不会出现幽灵条目；
+            # 也避免与用户合法 skill（ID 不能以点开头）撞名。
+            backup = os.path.join(skill_source_root("custom"), f".{skill_id}.upgrade-bak")
             if os.path.exists(backup):
-                shutil.rmtree(backup)
-            os.rename(dir_path, backup)
+                shutil.rmtree(backup, ignore_errors=True)
+            try:
+                os.rename(dir_path, backup)
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"升级失败：旧目录无法重命名（可能被其他程序占用）：{exc}") from exc
             try:
                 shutil.move(staged, dir_path)
             except Exception:
                 os.rename(backup, dir_path)
                 raise
-            try:
-                shutil.rmtree(backup)
-            except OSError:
-                pass
-            skill_write_meta(dir_path, {
+            backup_left = os.path.exists(backup)
+            if backup_left:
+                shutil.rmtree(backup, ignore_errors=True)
+                backup_left = os.path.exists(backup)
+            meta_written = skill_write_meta(dir_path, {
                 **meta,
                 "commit_sha": info["sha"],
                 "ref": info["ref"],
                 "skill_root": skill_rel,
                 "updated_at": now_ms(),
             })
-            return {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(dir_path, "custom")}
+            result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(dir_path, "custom")}
+            warnings = []
+            if backup_left:
+                warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.upgrade-bak")
+            if not meta_written:
+                warnings.append("升级元数据写入失败，后续更新检查不可用")
+            if warnings:
+                result["warnings"] = warnings
+            return result
     finally:
         try:
             os.remove(temp_zip)
