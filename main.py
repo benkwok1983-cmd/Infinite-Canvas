@@ -19599,12 +19599,14 @@ async def api_skill_delete(skill_id: str):
 class SkillGithubPreviewRequest(BaseModel):
     url: str = Field(min_length=1, max_length=500)
     ref: str = Field(default="", max_length=200)
+    subdir: str = Field(default="", max_length=300)
 
 class SkillGithubInstallRequest(BaseModel):
     url: str = Field(min_length=1, max_length=500)
     sha: str = Field(min_length=7, max_length=64)
     name: str = Field(default="", max_length=64)
     overwrite: bool = False
+    subdir: str = Field(default="", max_length=300)
 
 class SkillUpgradeRequest(BaseModel):
     sha: str = Field(default="", max_length=64)
@@ -19698,8 +19700,18 @@ def safe_extract_skill_zip(zip_path, dest_root):
         raise HTTPException(status_code=400, detail="压缩包结构异常（应只有一个顶层目录）")
     return os.path.join(dest_root, entries[0])
 
-def locate_skill_root(extracted_root):
-    """定位 SKILL.md：优先仓库根；否则要求恰好一个含 SKILL.md 的子目录。"""
+def locate_skill_root(extracted_root, subdir=""):
+    """定位 SKILL.md：优先仓库根；可显式指定子目录（monorepo 多 skill）；否则要求恰好一个含 SKILL.md 的子目录。"""
+    wanted = str(subdir or "").strip().strip("/\\")
+    if wanted:
+        if ".." in wanted.replace("\\", "/").split("/") or ":" in wanted or os.path.isabs(wanted):
+            raise HTTPException(status_code=400, detail="子目录路径不合法")
+        candidate = os.path.realpath(os.path.join(extracted_root, wanted))
+        if os.path.commonpath([os.path.realpath(extracted_root), candidate]) != os.path.realpath(extracted_root):
+            raise HTTPException(status_code=400, detail="子目录路径不合法")
+        if not os.path.isfile(os.path.join(candidate, "SKILL.md")):
+            raise HTTPException(status_code=400, detail=f"子目录中未找到 SKILL.md：{wanted}")
+        return candidate, wanted.replace("\\", "/")
     if os.path.isfile(os.path.join(extracted_root, "SKILL.md")):
         return extracted_root, ""
     candidates = []
@@ -19714,7 +19726,7 @@ def locate_skill_root(extracted_root):
     if not candidates:
         raise HTTPException(status_code=400, detail="仓库中未找到 SKILL.md（支持仓库根目录，或唯一包含 SKILL.md 的子目录）")
     listing = "、".join(os.path.relpath(c, extracted_root).replace("\\", "/") for c in candidates[:5])
-    raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}），请指定包含目标 Skill 的仓库子目录后重试")
+    raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}）。请通过 subdir 参数指定目标 Skill 所在的子目录后重试。")
 
 def validate_and_stage_skill(skill_root, staged_root):
     """校验 skill_root 并复制到 staged_root（临时暂存），返回 (entry, warnings)。"""
@@ -19732,9 +19744,10 @@ async def api_skill_github_preview(payload: SkillGithubPreviewRequest):
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
             extracted_root = safe_extract_skill_zip(temp_zip, extracted)
-            skill_root, skill_rel = locate_skill_root(extracted_root)
+            skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
+            entry["id"] = normalize_skill_id(payload.name or os.path.basename(skill_root.rstrip("/\\"))) or entry["name"]
             return {
                 "ok": True,
                 "repo": info,
@@ -19759,7 +19772,7 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
             extracted_root = safe_extract_skill_zip(temp_zip, extracted)
-            skill_root, skill_rel = locate_skill_root(extracted_root)
+            skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
             if not skill_id:
                 skill_id = normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
             if not SKILL_ID_RE.match(skill_id):
@@ -19854,7 +19867,7 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
             extracted_root = safe_extract_skill_zip(temp_zip, extracted)
-            skill_root, skill_rel = locate_skill_root(extracted_root)
+            skill_root, skill_rel = locate_skill_root(extracted_root, str(meta.get("skill_root") or ""))
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
             backup = dir_path + ".upgrade-bak"
