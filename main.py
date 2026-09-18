@@ -19310,6 +19310,291 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
     )
     return generate(req)
 
+# --- 画布 Skill 库 ---
+
+# Skill 是给生图/改写流程读取的「指令文档包」（SKILL.md + references/assets），不是可执行程序。
+# 安全红线（PRD FR2-4）：第三方 skill 的 scripts/ 目录一律不执行；~/.codex/skills/ 只读引用。
+SKILL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+SKILL_META_FILE = ".skill_meta.json"
+SKILLS_CUSTOM_DIR = os.path.join(BASE_DIR, "skills", "custom")
+SKILLS_BUILTIN_DIR = os.path.join(BASE_DIR, "skills")
+SKILLS_MAX_FILE_BYTES = 20 * 1024 * 1024
+SKILLS_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+SKILLS_MAX_FILES = 500
+SKILLS_ZIP_MAX_BYTES = 20 * 1024 * 1024
+SKILLS_SCRIPT_EXTS = {".py", ".sh", ".js", ".mjs", ".cjs", ".cmd", ".bat", ".ps1", ".exe", ".dll"}
+
+try:
+    import yaml as _skill_yaml
+except Exception:
+    _skill_yaml = None
+
+
+class SkillCreateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=64)
+    description: str = Field(default="", max_length=500)
+    content: str = Field(default="", max_length=200_000)
+
+
+class SkillUpdateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=200_000)
+
+
+def normalize_skill_id(value):
+    text = re.sub(r"\s+", "-", str(value or "").strip().lower())
+    text = re.sub(r"[^a-z0-9._-]+", "-", text).strip("-._")
+    return text[:64]
+
+def skill_source_root(source):
+    if source == "custom":
+        return os.path.realpath(SKILLS_CUSTOM_DIR)
+    if source == "builtin":
+        return os.path.realpath(SKILLS_BUILTIN_DIR)
+    if source == "codex":
+        user_profile = str(os.getenv("USERPROFILE") or "").strip()
+        codex_home = str(os.getenv("CODEX_HOME") or "").strip()
+        base = codex_home or (os.path.join(user_profile, ".codex") if user_profile else os.path.expanduser("~/.codex"))
+        return os.path.realpath(os.path.join(base, "skills"))
+    return ""
+
+def skill_dir_for(source, skill_id):
+    """解析来源目录下的 skill 目录，realpath 校验防路径穿越。"""
+    root = skill_source_root(source)
+    if not root:
+        raise HTTPException(status_code=400, detail=f"未知的 Skill 来源：{source}")
+    safe_id = str(skill_id or "").strip()
+    if source == "custom" and not SKILL_ID_RE.match(safe_id):
+        raise HTTPException(status_code=400, detail=f"Skill ID 不合法：{safe_id[:60]}")
+    target = os.path.realpath(os.path.join(root, safe_id))
+    if os.path.commonpath([root, target]) != root or os.path.basename(target) != safe_id:
+        raise HTTPException(status_code=400, detail="Skill 路径不合法")
+    if not os.path.isdir(target):
+        raise HTTPException(status_code=404, detail=f"Skill 不存在：{source}/{safe_id}")
+    return target
+
+def parse_skill_markdown_text(text):
+    """解析 SKILL.md：YAML frontmatter + 正文。yaml 缺失时回退 flat key: value 解析。"""
+    text = str(text or "").lstrip("\ufeff")
+    match = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", text, flags=re.S)
+    if not match:
+        return {}, text
+    fm_text, body = match.group(1), text[match.end():]
+    data = {}
+    if _skill_yaml is not None:
+        try:
+            loaded = _skill_yaml.safe_load(fm_text)
+            if isinstance(loaded, dict):
+                data = {str(key): value for key, value in loaded.items()}
+                return data, body
+        except Exception:
+            pass
+    for raw in fm_text.splitlines():
+        m = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", raw.strip())
+        if m:
+            data[m.group(1)] = m.group(2).strip().strip("\"'")
+    return data, body
+
+def skill_read_meta(dir_path):
+    meta_path = os.path.join(dir_path, SKILL_META_FILE)
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def skill_write_meta(dir_path, meta):
+    try:
+        with open(os.path.join(dir_path, SKILL_META_FILE), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
+    """扫描一个 skill 目录并组装元数据条目；缺少 SKILL.md 时也返回（标记 has_skill_md=False 供前端提示）。"""
+    dir_path = os.path.realpath(dir_path)
+    skill_id = os.path.basename(dir_path)
+    skill_md = os.path.join(dir_path, "SKILL.md")
+    has_skill_md = os.path.isfile(skill_md)
+    name, description, version, license = skill_id, "", "", ""
+    extra_metadata = {}
+    body = ""
+    if has_skill_md:
+        try:
+            with open(skill_md, "r", encoding="utf-8", errors="replace") as f:
+                fm, body = parse_skill_markdown_text(f.read())
+            name = str(fm.get("name") or skill_id)
+            description = str(fm.get("description") or "").strip()
+            version = str(fm.get("version") or "").strip()
+            license_text = fm.get("license") or fm.get("licenses")
+            license_text = "" if isinstance(license_text, (dict, list)) else str(license_text or "").strip()
+            license = license_text[:120]
+            allowed_meta = {"name", "description", "version", "license", "licenses"}
+            extra_metadata = {str(k): (v if isinstance(v, (str, int, float, bool)) else json.dumps(v, ensure_ascii=False)[:400]) for k, v in fm.items() if str(k) not in allowed_meta}
+        except Exception:
+            body = ""
+    files = 0
+    total_bytes = 0
+    has_scripts = False
+    script_files = []
+    references = 0
+    assets = 0
+    updated_at = 0
+    truncated = False
+    for root, dirs, names in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in names:
+            if fname.startswith(".") or fname == SKILL_META_FILE:
+                continue
+            files += 1
+            if files > SKILLS_MAX_FILES:
+                truncated = True
+                break
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, dir_path).replace("\\", "/")
+            try:
+                total_bytes += os.path.getsize(fpath)
+                updated_at = max(updated_at, int(os.path.getmtime(fpath) * 1000))
+            except OSError:
+                pass
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SKILLS_SCRIPT_EXTS:
+                has_scripts = True
+                if len(script_files) < 8:
+                    script_files.append(rel)
+            if rel.startswith("references/"):
+                references += 1
+            elif rel.startswith("assets/"):
+                assets += 1
+        if truncated:
+            break
+    warnings = []
+    if not has_skill_md:
+        warnings.append("缺少 SKILL.md，无法作为生图 Skill 使用")
+    if has_scripts:
+        warnings.append("包含脚本文件（仅列出，永不在本项目中执行）")
+    if truncated or total_bytes > SKILLS_MAX_TOTAL_BYTES:
+        warnings.append("超出大小/文件数限制，统计不完整")
+    meta = skill_read_meta(dir_path) if source == "custom" else {}
+    entry = {
+        "id": skill_id,
+        "name": name,
+        "description": description,
+        "version": version,
+        "license": license,
+        "source": source,
+        "readonly": readonly,
+        "has_skill_md": has_skill_md,
+        "has_scripts": has_scripts,
+        "script_files": script_files,
+        "references_count": references,
+        "assets_count": assets,
+        "files": files,
+        "total_bytes": total_bytes,
+        "updated_at": updated_at,
+        "warnings": warnings,
+        "metadata": extra_metadata,
+        "summary": re.sub(r"\s+", " ", body).strip()[:200],
+    }
+    if source == "custom":
+        entry["install"] = {
+            "source": str(meta.get("source") or "local"),
+            "repo_url": str(meta.get("repo_url") or ""),
+            "commit_sha": str(meta.get("commit_sha") or ""),
+            "installed_at": int(meta.get("installed_at") or 0),
+        }
+    if include_body:
+        entry["body"] = body[:200_000]
+        entry["metadata"] = extra_metadata
+    return entry
+
+def skill_scan_all(include_body=False):
+    skills = []
+    seen_keys = set()
+    for source, readonly in (("custom", False), ("builtin", True), ("codex", True)):
+        root = skill_source_root(source)
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            dir_path = os.path.join(root, name)
+            if source == "builtin" and name == "custom":
+                continue
+            if not os.path.isdir(dir_path) or name.startswith("."):
+                continue
+            entry = skill_entry_from_dir(dir_path, source, readonly=readonly, include_body=include_body)
+            key = (source, entry["id"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            skills.append(entry)
+    return skills
+
+@app.get("/api/skills")
+async def api_skills_list():
+    return {"skills": skill_scan_all(include_body=False)}
+
+@app.get("/api/skills/{source}/{skill_id}")
+async def api_skill_detail(source: str, skill_id: str):
+    dir_path = skill_dir_for(source, skill_id)
+    entry = skill_entry_from_dir(dir_path, source, readonly=(source != "custom"), include_body=True)
+    rel_files = []
+    for root, dirs, names in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in names:
+            if fname.startswith(".") or fname == SKILL_META_FILE:
+                continue
+            rel_files.append(os.path.relpath(os.path.join(root, fname), dir_path).replace("\\", "/"))
+    entry["file_list"] = sorted(rel_files)[:SKILLS_MAX_FILES]
+    return entry
+
+@app.post("/api/skills/custom")
+async def api_skill_create(payload: SkillCreateRequest):
+    skill_id = normalize_skill_id(payload.name)
+    if not SKILL_ID_RE.match(skill_id):
+        raise HTTPException(status_code=400, detail="Skill 名称只能包含小写字母/数字/._-，且以字母或数字开头")
+    target = os.path.join(skill_source_root("custom"), skill_id)
+    if os.path.exists(target):
+        raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}")
+    try:
+        os.makedirs(target, exist_ok=True)
+        frontmatter = f"---\nname: {payload.name.strip()}\ndescription: {payload.description.strip()}\nversion: 0.1.0\n---\n\n"
+        content = frontmatter + (payload.content.strip() + "\n" if payload.content.strip() else "# 在此编写该风格的使用指令（供生图改写流程读取）\n")
+        with open(os.path.join(target, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(content)
+        skill_write_meta(target, {"source": "local", "installed_at": now_ms(), "updated_at": now_ms()})
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"创建 Skill 失败：{exc}") from exc
+    return {"ok": True, "id": skill_id}
+
+@app.put("/api/skills/custom/{skill_id}")
+async def api_skill_update(skill_id: str, payload: SkillUpdateRequest):
+    dir_path = skill_dir_for("custom", skill_id)
+    skill_md = os.path.join(dir_path, "SKILL.md")
+    if not os.path.isfile(skill_md):
+        raise HTTPException(status_code=400, detail="该目录缺少 SKILL.md，不能作为 Skill 编辑")
+    try:
+        with open(skill_md, "w", encoding="utf-8") as f:
+            f.write(payload.content.replace("\r\n", "\n"))
+        meta = skill_read_meta(dir_path)
+        meta["updated_at"] = now_ms()
+        skill_write_meta(dir_path, meta)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"保存 Skill 失败：{exc}") from exc
+    return {"ok": True}
+
+@app.delete("/api/skills/custom/{skill_id}")
+async def api_skill_delete(skill_id: str):
+    dir_path = skill_dir_for("custom", skill_id)
+    try:
+        shutil.rmtree(dir_path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"删除 Skill 失败：{exc}") from exc
+    return {"ok": True}
+
 if __name__ == "__main__":
     import uvicorn
     # 关闭服务端协议级 WebSocket ping：部分客户端（如 PS UXP 面板）不会自动回 pong，
