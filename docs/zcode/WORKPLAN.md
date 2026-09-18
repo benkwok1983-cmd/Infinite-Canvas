@@ -41,11 +41,11 @@
 
 | 任务 | 内容 | 状态 |
 |---|---|---|
-| T3.1 | 数据模型与存储：`data/skills.json` 索引（元数据）＋ `skills/custom/` 目录规范；解析 SKILL.md frontmatter 的独立模块 | 待办 |
-| T3.2 | `/api/skills` 扫描/列表/详情/删除；结构校验（无 SKILL.md 拒绝、大小/类型/深度限制）；`~/.codex/skills/` 只读 | 待办 |
-| T3.3 | GitHub 导入（URL→拉取→校验→固定 SHA→安装）＋ zip 导入；升级 diff 接口 | 待办 |
-| T3.4 | 自建 skill 编辑 API（创建/更新 SKILL.md＋style 配置） | 待办 |
-| T3.5 | 单测（解析/校验/导入拒绝路径）＋ 审查 ＋ 日志/handoff ＋ 提交推送 | 待办 |
+| T3.1 | 数据模型与存储：`skills/custom/<id>/` 目录规范 + `.skill_meta.json`（随目录走）；SKILL.md frontmatter 解析（yaml+防炸弹+回退） | ✅ 2026-09-19 |
+| T3.2 | `/api/skills` 扫描/列表/详情/删除（custom/builtin/codex 三来源）；路径穿越防护；`~/.codex/skills/` 只读 | ✅ 2026-09-19 |
+| T3.3 | GitHub 导入（preview 确认→固定 SHA 安装→409/overwrite）＋ monorepo subdir ＋ zip 导入；check-update（轻量 commits API）/upgrade（点前缀备份回滚）；真实仓库全链路验证 | ✅ 2026-09-19 |
+| T3.4 | 自建 skill 创建/更新/删除 API（frontmatter 服务端生成防注入；style 字段随 SKILL.md 编辑） | ✅ 2026-09-19 |
+| T3.5 | 单测 23 项全绿；子代理审查（P1×1/P2×7/P3×9 → P1/P2 全修复）；真实仓库冒烟；日志/handoff/推送 | ✅ 2026-09-19 |
 
 ## Phase 4：优化 2 —— Skill 管理页（前端）
 
