@@ -87,7 +87,9 @@ def resolve_host_model():
 
 
 def build_body(host_model, tool_model):
-    tool = {"type": "image_generation", "background": "auto", "output_format": "png"}
+    # 与 main.py codex_image_request_body() 保持同形（size/quality/background/output_format）。
+    # 两处必须同步修改，否则 T1.2 探测结果无法为生产 request create 路径背书（审查 P1-2）。
+    tool = {"type": "image_generation", "background": "auto", "output_format": "png", "size": "1024x1024", "quality": "high"}
     if tool_model:
         tool["model"] = tool_model
     return {
@@ -111,17 +113,26 @@ def iter_dicts(value):
 
 
 def parse_events(events_text):
-    """从 --json-events 的 JSONL 中提取观察到的 tools[].model 与外层 model。"""
+    """从 --json-events 的 JSONL（或整体 pretty JSON）中提取观察到的 tools[].model 与外层 model。"""
     observed_models = []
     outer_models = []
-    for line in (events_text or "").splitlines():
+    text = str(events_text or "")
+    events = []
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            event = json.loads(line)
+            events.append(json.loads(line))
         except Exception:
             continue
+    if not events and text.strip():
+        try:
+            parsed = json.loads(text)
+            events = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            return [], []
+    for event in events:
         for item in iter_dicts(event):
             response = item.get("response")
             if isinstance(response, dict):
@@ -181,7 +192,11 @@ def run_variant(cli, variant, tool_model, host_model, out_dir, timeout):
     duration = round(time.time() - started, 1)
     (out_dir / f"result-{variant}.json").write_text(stdout_text, encoding="utf-8")
     (out_dir / f"events-{variant}.jsonl").write_text(stderr_text, encoding="utf-8")
-    observed, outer = parse_events(stderr_text) or parse_events(stdout_text)
+    # 事件可能在 stderr（--json-events）或 stdout（最终 result JSON），两路都解析并合并
+    observed_stderr, outer_stderr = parse_events(stderr_text)
+    observed_stdout, outer_stdout = parse_events(stdout_text)
+    observed = observed_stderr + observed_stdout
+    outer = outer_stderr + outer_stdout
     size = png_size(image_path) if image_path.is_file() else None
     return {
         "variant": variant,

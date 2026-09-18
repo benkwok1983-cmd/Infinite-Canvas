@@ -17169,14 +17169,14 @@ async function resumeSmartPendingNode(node, logContext={}){
         if(task.failed && task.recoverTaskId) return;
         try {
             const result = await pollSmartCanvasTask(task.taskId);
-            if(result?.image_model_observed){
+            if(result?.image_model_requested){
                 node.lastImageModelMeta = {
                     requested:result.image_model_requested || '',
                     observed:result.image_model_observed || '',
                     confirmed:Boolean(result.image_model_confirmed),
                     size:Array.isArray(result.image_size) ? result.image_size : null
                 };
-                if(!result.image_model_confirmed && result.image_model_requested && result.image_model_requested !== 'auto/latest'){
+                if(result.image_model_requested !== 'auto/latest' && !result.image_model_confirmed){
                     toast(tr('smart.imageModelUnconfirmed'));
                 }
             }

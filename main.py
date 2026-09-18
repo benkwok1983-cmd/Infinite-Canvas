@@ -4992,10 +4992,38 @@ def codex_image_request_body(prompt_text, host_model, tool_model="", size_arg=""
     }
 
 def parse_codex_observed_image_model(events_text=""):
-    """从 --json-events 事件流（或最终 result JSON）中提取服务端实际使用的 image_generation 工具模型。"""
-    observed = []
+    """从 --json-events 事件流（或最终 result JSON）提取服务端实际使用的 image_generation 工具模型。
 
-    def walk(value):
+    优先采信 response.completed 事件：response.created 会原样回显请求值（含实验性 2.5 名），
+    completed 才反映服务端最终路由（上游实测返回别名 gpt-image-2-codex）。
+    """
+    text = str(events_text or "")
+    events = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            continue
+    if not events and text.strip():
+        try:
+            parsed = json.loads(text)
+            events = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            return []
+
+    def find_completed(value):
+        if isinstance(value, dict):
+            if str(value.get("type") or "") == "response.completed":
+                return True
+            return any(find_completed(child) for child in value.values())
+        if isinstance(value, list):
+            return any(find_completed(child) for child in value)
+        return False
+
+    def walk(value, sink):
         if isinstance(value, dict):
             response = value.get("response")
             if isinstance(response, dict):
@@ -5005,22 +5033,19 @@ def parse_codex_observed_image_model(events_text=""):
                         and str(tool.get("type") or "") == "image_generation"
                         and tool.get("model")
                     ):
-                        observed.append(str(tool["model"]))
+                        sink.append(str(tool["model"]))
             for child in value.values():
-                walk(child)
+                walk(child, sink)
         elif isinstance(value, list):
             for child in value:
-                walk(child)
+                walk(child, sink)
 
-    for line in str(events_text or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            walk(json.loads(line))
-        except Exception:
-            continue
-    return observed
+    observed_all = []
+    observed_completed = []
+    for event in events:
+        sink = observed_completed if find_completed(event) else observed_all
+        walk(event, sink)
+    return observed_completed or observed_all
 
 def codex_image_dimensions(path=""):
     if not path or not os.path.isfile(path):
@@ -14261,6 +14286,11 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
+    # Codex 诚实反馈元数据透传（PRD FR1-5）：观察模型/确认标志等供前端溯源与提示
+    if isinstance(raw, dict):
+        for meta_key in ("image_model_requested", "image_model_observed", "image_model_confirmed", "image_size", "host_model", "tool_provider"):
+            if meta_key in raw and raw[meta_key] is not None:
+                result[meta_key] = raw[meta_key]
     save_to_history(result)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)

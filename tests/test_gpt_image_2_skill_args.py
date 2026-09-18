@@ -125,7 +125,21 @@ class CodexExperimentalImageModelTests(unittest.TestCase):
                 "not-json-line",
             ]
         )
-        self.assertEqual(main.parse_codex_observed_image_model(events), ["gpt-image-2-codex", "gpt-image-2-codex"])
+        self.assertEqual(main.parse_codex_observed_image_model(events), ["gpt-image-2-codex"])
+
+    def test_observed_model_prefers_completed_over_created_echo(self):
+        # response.created 回显请求值（实验性 2.5 名），completed 才是服务端最终路由
+        events = "\n".join(
+            [
+                json.dumps({"type": "response.created", "response": {"tools": [{"type": "image_generation", "model": "gpt-image-2.5-flare"}]}}),
+                json.dumps({"type": "response.completed", "response": {"tools": [{"type": "image_generation", "model": "gpt-image-2-codex"}]}}),
+            ]
+        )
+        self.assertEqual(main.parse_codex_observed_image_model(events), ["gpt-image-2-codex"])
+
+    def test_observed_model_parses_pretty_json_result_payload(self):
+        payload = json.dumps({"type": "response.completed", "response": {"tools": [{"type": "image_generation", "model": "gpt-image-2-codex"}]}}, indent=2)
+        self.assertEqual(main.parse_codex_observed_image_model(payload), ["gpt-image-2-codex"])
 
     def test_observed_model_empty_on_unrelated_events(self):
         self.assertEqual(main.parse_codex_observed_image_model('{"type":"progress","message":"waiting"}'), [])

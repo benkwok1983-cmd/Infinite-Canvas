@@ -854,6 +854,19 @@ function showErrorModal(message, title=tr('canvas.generationFailed')){
     errorModal.classList.add('open');
     refreshIcons();
 }
+function showLightToast(message, duration=3600){
+    let host = document.getElementById('canvasLightToast');
+    if(!host){
+        host = document.createElement('div');
+        host.id = 'canvasLightToast';
+        host.style.cssText = 'position:fixed;left:50%;bottom:76px;transform:translateX(-50%);z-index:9999;background:rgba(15,23,42,.92);color:#f8fafc;padding:10px 16px;border-radius:10px;font-size:13px;line-height:1.5;max-width:min(520px,86vw);box-shadow:0 10px 30px rgba(15,23,42,.25);opacity:0;transition:opacity .25s ease;pointer-events:none;';
+        document.body.appendChild(host);
+    }
+    host.textContent = message;
+    requestAnimationFrame(() => { host.style.opacity = '1'; });
+    clearTimeout(host._hideTimer);
+    host._hideTimer = setTimeout(() => { host.style.opacity = '0'; }, duration);
+}
 function apiErrorMessage(data, fallback='请求失败'){
     if(!data) return fallback;
     if(typeof data === 'string') return data || fallback;
@@ -13750,9 +13763,8 @@ function completeCanvasImageTask(taskId, result){
         run: pending.run || {},
     };
     meta.run.request = requestMetaFromResult(result);
-    if(result?.image_model_observed && !result.image_model_confirmed && result.image_model_requested && result.image_model_requested !== 'auto/latest'){
-        // canvas.js 无轻量 toast；未确认提示走溯源记录 + 控制台，不打断生成流
-        console.warn('[canvas] Image 2.5 未被服务端确认：requested=%s observed=%s', result.image_model_requested, result.image_model_observed);
+    if(result?.image_model_requested && result.image_model_requested !== 'auto/latest' && !result.image_model_confirmed){
+        showLightToast(tr('canvas.imageModelUnconfirmed'));
     }
     const images = result.images || [];
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
