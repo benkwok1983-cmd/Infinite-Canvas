@@ -20123,12 +20123,22 @@ def skill_content_snapshot(dir_path):
     except OSError:
         return "content:unknown"
 
+try:
+    SKILL_FAST_PROMPT_MAX = max(1000, int(os.getenv("SKILL_FAST_PROMPT_MAX", "3800")))
+except Exception:
+    SKILL_FAST_PROMPT_MAX = 3800
+
 def compose_skill_prompt_fast(body_text, user_prompt):
-    instruction = re.sub(r"\s+", " ", str(body_text or "")).strip()[:8000] or "按照该 Skill 的风格要求生成图像。"
-    return (
-        f"请严格按照以下 Skill 指令生成图像。Skill 指令：{instruction} "
-        f"用户需求：{str(user_prompt or '').strip()}"
-    )
+    """快速模式拼接：skill 指令 + 用户需求，总长受 SKILL_FAST_PROMPT_MAX 约束
+    （ModelScope 等上游 prompt 上限约 4000，实测验收发现超限被拒）。"""
+    instruction = re.sub(r"\s+", " ", str(body_text or "")).strip()
+    prompt_text = str(user_prompt or "").strip()
+    prefix = "请严格按照以下 Skill 指令生成图像。Skill 指令："
+    middle = " 用户需求："
+    budget = max(500, SKILL_FAST_PROMPT_MAX - len(prefix) - len(middle) - len(prompt_text))
+    if len(instruction) > budget:
+        instruction = instruction[:budget].rstrip() + "…（Skill 指令超出长度上限，已截取核心部分）"
+    return f"{prefix}{instruction}{middle}{prompt_text}"
 
 SKILL_LLM_SYSTEM_PROMPT = (
     "你是生图提示词改写助手。请根据 SKILL 指令把用户需求改写成一条最终的生图提示词。"

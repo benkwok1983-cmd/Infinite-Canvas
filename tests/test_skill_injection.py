@@ -37,6 +37,13 @@ class SkillInjectionTests(unittest.TestCase):
             p.stop()
         self.tmp.cleanup()
 
+    def test_fast_compile_truncates_to_upstream_limit(self):
+        async def run():
+            result = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="fast"), "short prompt")
+            return result["compiled_prompt"]
+        compiled = self._run(run())
+        self.assertLessEqual(len(compiled), main.SKILL_FAST_PROMPT_MAX + 50)
+
     def test_fast_compile_composes_body_and_prompt(self):
         async def run():
             result = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="fast"), "a cat on a windowsill")
