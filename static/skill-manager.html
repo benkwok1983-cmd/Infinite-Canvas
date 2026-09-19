@@ -19,7 +19,7 @@
     <script src="/static/vendor/js/lucide.js?v=2026.08.28.1788924938"></script>
     <script src="/static/js/theme.js?v=2026.08.28.1788924902"></script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.28.1788924798">
-    <link rel="stylesheet" href="/static/css/skill-manager.css?v=2026.08.28.1789789420">
+    <link rel="stylesheet" href="/static/css/skill-manager.css?v=2026.08.28.1789807284">
 </head>
 <body>
     <div class="skill-page">
@@ -80,6 +80,12 @@
                     <label class="skill-form-label">SKILL.md 内容</label>
                     <textarea id="skillEditContent" class="skill-textarea" rows="16" placeholder="编写该风格的使用指令（供生图改写流程读取）。保存后正文会追加到自动生成的 frontmatter 之后。"></textarea>
                     <div class="skill-form-hint" id="skillEditContentHint"></div>
+                </div>
+                <div class="skill-form-row">
+                    <label class="skill-form-label">样式样板（可选）</label>
+                    <div class="skill-form-hint" style="margin-bottom:6px;">同一风格下的多种样板（如不同墨色/纹理/配方），画布 Skill 节点上会出现样板下拉。留空则由 Skill 指令自动决定。</div>
+                    <div id="skillVariantsList"></div>
+                    <button id="skillVariantAdd" class="skill-mini-btn" type="button"><i data-lucide="plus"></i>添加样板</button>
                 </div>
                 <div class="skill-modal-actions">
                     <button class="skill-btn" type="button" data-close="skillEditOverlay"><span>取消</span></button>
@@ -157,6 +163,6 @@
     </div>
 
     <div id="skillToast" class="skill-toast"></div>
-    <script src="/static/js/skill-manager.js?v=2026.08.28.1789786707"></script>
+    <script src="/static/js/skill-manager.js?v=2026.08.28.1789807284"></script>
 </body>
 </html>

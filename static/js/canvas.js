@@ -3120,15 +3120,16 @@ async function runMsGenNode(nodeId, opts={}){
     const msModel = MS_GEN_MODELS[modelKey] || MS_GEN_MODELS.zimage;
     const msModelId = currentMsModelId(modelKey, node);
     const msLoras = modelscopeLorasForModel(msModelId);
-    if(!prompt){ alert(tr('canvas.needPrompt')); return; }
+    if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
     if(msModel.supportsImage && !refs.length){ alert(tr('canvas.needImage')); return; }
-    // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）
+    // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）。
+    // 提示词可选：有参考图 + skill 即可生图（编译产物=skill 指令与所选样板）
     let skillUsed = null;
     if(skillSource){
         try {
             const compiled = await fetch('/api/skills/compile-prompt', {
                 method:'POST', headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, prompt})
+                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', prompt})
             }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
             prompt = compiled.compiled_prompt;
             skillUsed = {...compiled.skill_used, cached:compiled.cached};
@@ -8397,11 +8398,22 @@ function skillOptionsHtml(node){
     }
     return options.join('');
 }
+function skillVariantOptionsHtml(node){
+    const found = skillLibraryCache.list.find(s => s.source === (node.skillSource || 'custom') && s.id === node.skillId);
+    const variants = found?.variants || [];
+    if(!variants.length) return '';
+    const selected = node.skillVariant || '';
+    return `<select class="select-lite skill-variant-select mb-2">
+        <option value="" ${!selected ? 'selected' : ''}>${escapeHtml(tr('canvas.skillVariantAuto'))}</option>
+        ${variants.map(v => `<option value="${escapeHtml(v.id)}" ${v.id === selected ? 'selected' : ''}>${escapeHtml(v.label)}</option>`).join('')}
+    </select>`;
+}
 function renderSkillBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'skill-node-body';
     wrap.innerHTML = `
         <select class="select-lite skill-select mb-2">${skillOptionsHtml(node)}</select>
+        ${skillVariantOptionsHtml(node)}
         <div class="skill-mode-row">
             <button type="button" class="skill-mode-btn ${node.skillMode !== 'llm' ? 'active' : ''}" data-mode="fast">${tr('canvas.skillFast')}</button>
             <button type="button" class="skill-mode-btn ${node.skillMode === 'llm' ? 'active' : ''}" data-mode="llm">${tr('canvas.skillSmart')}</button>
@@ -8418,8 +8430,20 @@ function renderSkillBody(node){
         const found = skillLibraryCache.list.find(s => s.source === node.skillSource && s.id === node.skillId);
         node.skillName = found?.name || '';
         node.skillVersion = found?.version || '';
+        node.skillVariant = '';
         scheduleSave();
+        render();
     };
+    const variantSelect = wrap.querySelector('.skill-variant-select');
+    if(variantSelect){
+        variantSelect.onmousedown = e => e.stopPropagation();
+        variantSelect.onclick = e => e.stopPropagation();
+        variantSelect.onchange = e => {
+            e.stopPropagation();
+            node.skillVariant = e.target.value || '';
+            scheduleSave();
+        };
+    }
     wrap.querySelectorAll('.skill-mode-btn').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = e => {
@@ -11336,7 +11360,7 @@ function mediaRefsFromNode(node){
 function generatorSources(gen){
     return connections.filter(c => c.to === gen.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
         if(n.type === 'skill'){
-            return {id:n.id, type:'skill', label:tr('canvas.skillNode'), preview:'', refs:[], prompt:'', skill:{source:n.skillSource || 'custom', id:n.skillId, mode:n.skillMode || 'fast', name:n.skillName || '', version:n.skillVersion || ''}};
+            return {id:n.id, type:'skill', label:tr('canvas.skillNode'), preview:'', refs:[], prompt:'', skill:{source:n.skillSource || 'custom', id:n.skillId, mode:n.skillMode || 'fast', variant:n.skillVariant || '', name:n.skillName || '', version:n.skillVersion || ''}};
         }
         if(n.type === 'output' && (n.images||[]).length){
             // 从 output 节点取最新一张图当作 reference 给下游
@@ -11508,7 +11532,7 @@ async function runGenerator(genId, opts={}){
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
-    if(skillSource) payload.skill = {source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode};
+    if(skillSource) payload.skill = {source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || ''};
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
     let pendingIds = [];

@@ -154,12 +154,31 @@ function openEditor(item) {
     document.getElementById('skillEditName').value = '';
     document.getElementById('skillEditDesc').value = '';
     document.getElementById('skillEditContent').value = '';
+    document.getElementById('skillVariantsList').innerHTML = '';
     openOverlay('skillEditOverlay');
     if (item) {
         api(`/api/skills/custom/${encodeURIComponent(item.id)}`).then(detail => {
             document.getElementById('skillEditContent').value = detail.body || '';
+            (detail.variants || []).forEach(v => addVariantRow(v.label || '', v.prompt || ''));
         }).catch(error => toast(error.message));
     }
+}
+function addVariantRow(label = '', prompt = '') {
+    const list = document.getElementById('skillVariantsList');
+    const row = document.createElement('div');
+    row.className = 'skill-variant-row';
+    row.innerHTML = `
+        <input class="skill-input v-label" type="text" maxlength="80" placeholder="样板名（如：单墨 · 钴蓝）" value="${escapeHtml(label)}">
+        <input class="skill-input v-prompt" type="text" maxlength="2000" placeholder="该样板的追加指令（墨色/纹理/构图约束）" value="${escapeHtml(prompt)}">
+        <button class="skill-mini-btn danger v-del" type="button">删</button>`;
+    row.querySelector('.v-del').onclick = () => row.remove();
+    list.appendChild(row);
+}
+function collectVariants() {
+    return [...document.querySelectorAll('#skillVariantsList .skill-variant-row')].map(row => ({
+        label: row.querySelector('.v-label').value.trim(),
+        prompt: row.querySelector('.v-prompt').value.trim(),
+    })).filter(v => v.label);
 }
 
 async function saveEditor() {
@@ -167,14 +186,15 @@ async function saveEditor() {
     const saveBtn = document.getElementById('skillEditSave');
     saveBtn.disabled = true;
     try {
+        const variants = collectVariants();
         if (editingId) {
-            await api(`/api/skills/custom/${encodeURIComponent(editingId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+            await api(`/api/skills/custom/${encodeURIComponent(editingId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content, variants }) });
             toast('已保存');
         } else {
             const name = document.getElementById('skillEditName').value.trim();
             const description = document.getElementById('skillEditDesc').value.trim();
             if (!name) { toast('请填写名称'); return; }
-            const created = await api('/api/skills/custom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description, content }) });
+            const created = await api('/api/skills/custom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description, content, variants }) });
             editingId = created.id;
             toast(`已创建：${created.id}`);
         }
@@ -356,6 +376,7 @@ document.getElementById('skillCreateBtn').addEventListener('click', () => openEd
 document.getElementById('skillGithubBtn').addEventListener('click', () => { resetGithubOverlay(); openOverlay('skillGithubOverlay'); });
 document.getElementById('skillZipBtn').addEventListener('click', () => zipInput.click());
 document.getElementById('skillEditSave').addEventListener('click', saveEditor);
+document.getElementById('skillVariantAdd').addEventListener('click', () => addVariantRow());
 document.getElementById('ghPreviewBtn').addEventListener('click', githubPreview);
 document.getElementById('ghInstallBtn').addEventListener('click', githubInstall);
 document.getElementById('ghBackBtn').addEventListener('click', () => { document.getElementById('ghStepUrl').hidden = false; document.getElementById('ghStepConfirm').hidden = true; });

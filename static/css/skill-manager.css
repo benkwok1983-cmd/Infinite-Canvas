@@ -116,3 +116,9 @@ button { border:0; cursor:pointer; }
     .skill-form-row.two-col { grid-template-columns:1fr; }
     .skill-page { padding:16px 14px 30px; }
 }
+
+/* 样式样板编辑行 */
+.skill-variant-row { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+.skill-variant-row .v-label { flex:0 0 32%; }
+.skill-variant-row .v-prompt { flex:1 1 auto; font-family:ui-monospace, Consolas, monospace; font-size:12px; }
+.skill-variant-row .v-del { flex:0 0 auto; }

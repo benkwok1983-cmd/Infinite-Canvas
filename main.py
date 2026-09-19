@@ -2812,6 +2812,7 @@ class SkillSelection(BaseModel):
     source: str = "custom"
     id: str = Field(min_length=1, max_length=80)
     mode: str = "fast"
+    variant: str = ""
     provider: str = ""
     model: str = ""
 
@@ -19366,15 +19367,66 @@ except Exception:
     _skill_yaml = None
 
 
+class SkillVariantItem(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    prompt: str = Field(default="", max_length=2000)
+    id: str = ""
+
+
 class SkillCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=64)
     description: str = Field(default="", max_length=500)
     content: str = Field(default="", max_length=200_000)
+    variants: List[SkillVariantItem] = []
 
 
 class SkillUpdateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=200_000)
+    variants: Optional[List[SkillVariantItem]] = None
 
+
+def normalize_skill_variant_items(items):
+    """表单变体 → frontmatter 结构（id 从 label 推导，去重）。"""
+    out = []
+    seen = set()
+    for item in items or []:
+        label = re.sub(r"[\r\n\t]+", " ", str(item.label or "").strip())[:80]
+        prompt = str(item.prompt or "").strip()[:2000]
+        if not label:
+            continue
+        vid = normalize_skill_id(str(item.id or "") or label) or normalize_skill_id(label)
+        if not vid or vid in seen:
+            vid = f"{vid or 'variant'}-{len(out) + 1}"
+        seen.add(vid)
+        out.append({"id": vid, "label": label, "prompt": prompt})
+    return out
+
+
+def rewrite_skill_frontmatter(dir_path, updates):
+    """局部重写 SKILL.md frontmatter 的指定字段（保留其余字段与正文）。"""
+    md_path = os.path.join(dir_path, "SKILL.md")
+    with open(md_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    match = re.match(r"^---[\t]*\r?\n(.*?)\r?\n---[\t]*\r?\n?", text, flags=re.S)
+    fm = {}
+    body = text
+    if match:
+        if _skill_yaml is not None:
+            try:
+                loaded = _skill_yaml.safe_load(match.group(1))
+                if isinstance(loaded, dict):
+                    fm = loaded
+            except Exception:
+                fm = {}
+        body = text[match.end():]
+    else:
+        body = text
+    fm.update(updates)
+    if _skill_yaml is None:
+        raise HTTPException(status_code=500, detail="缺少 yaml 库，无法写入样式样板")
+    new_text = "---\n" + _skill_yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, width=120) + "---\n" + body
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(new_text.replace("\r\n", "\n"))
 
 def normalize_skill_id(value):
     text = re.sub(r"\s+", "-", str(value or "").strip().lower())
@@ -19475,6 +19527,7 @@ def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
     skill_md = os.path.join(dir_path, "SKILL.md")
     has_skill_md = os.path.isfile(skill_md)
     name, description, version, license = skill_id, "", "", ""
+    skill_variants = []
     extra_metadata = {}
     body = ""
     if has_skill_md:
@@ -19487,7 +19540,22 @@ def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
             license_text = fm.get("license") or fm.get("licenses")
             license_text = "" if isinstance(license_text, (dict, list)) else str(license_text or "").strip()
             license = license_text[:120]
-            allowed_meta = {"name", "description", "version", "license", "licenses"}
+            # 样式变体（frontmatter variants: [{id,label,prompt}]）：节点二级下拉的数据源
+            skill_variants = []
+            raw_variants = fm.get("variants")
+            if isinstance(raw_variants, list):
+                seen_ids = set()
+                for item in raw_variants:
+                    if not isinstance(item, dict):
+                        continue
+                    vid = normalize_skill_id(str(item.get("id") or item.get("label") or ""))[:60]
+                    label = str(item.get("label") or vid).strip()[:80]
+                    vprompt = str(item.get("prompt") or "").strip()[:2000]
+                    if not vid or vid in seen_ids:
+                        continue
+                    seen_ids.add(vid)
+                    skill_variants.append({"id": vid, "label": label, "prompt": vprompt})
+            allowed_meta = {"name", "description", "version", "license", "licenses", "variants"}
             extra_metadata = {str(k): (v if isinstance(v, (str, int, float, bool)) else json.dumps(v, ensure_ascii=False)[:400]) for k, v in fm.items() if str(k) not in allowed_meta}
         except Exception:
             body = ""
@@ -19552,6 +19620,7 @@ def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
         "updated_at": updated_at,
         "warnings": warnings,
         "metadata": extra_metadata,
+        "variants": skill_variants,
         "summary": re.sub(r"\s+", " ", body).strip()[:200],
     }
     if source == "custom":
@@ -19621,8 +19690,12 @@ async def api_skill_create(payload: SkillCreateRequest):
         return re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
     name_clean = _clean(payload.name)[:100]
     desc_clean = _clean(payload.description)[:400]
+    skill_variants = normalize_skill_variant_items(payload.variants)
+    fm_data = {"name": name_clean, "description": desc_clean, "version": "0.1.0"}
+    if skill_variants:
+        fm_data["variants"] = skill_variants
     if _skill_yaml is not None:
-        fm_body = _skill_yaml.safe_dump({"name": name_clean, "description": desc_clean, "version": "0.1.0"}, allow_unicode=True, sort_keys=False)
+        fm_body = _skill_yaml.safe_dump(fm_data, allow_unicode=True, sort_keys=False)
     else:
         esc = lambda v: v.replace("\\", "\\\\").replace('"', '\\"')
         fm_body = f'name: "{esc(name_clean)}"\ndescription: "{esc(desc_clean)}"\nversion: "0.1.0"\n'
@@ -19645,6 +19718,8 @@ async def api_skill_update(skill_id: str, payload: SkillUpdateRequest):
     try:
         with open(skill_md, "w", encoding="utf-8") as f:
             f.write(payload.content.replace("\r\n", "\n"))
+        if payload.variants is not None:
+            rewrite_skill_frontmatter(dir_path, {"variants": normalize_skill_variant_items(payload.variants)})
         meta = skill_read_meta(dir_path)
         meta["updated_at"] = now_ms()
         skill_write_meta(dir_path, meta)
@@ -20128,13 +20203,16 @@ try:
 except Exception:
     SKILL_FAST_PROMPT_MAX = 3800
 
-def compose_skill_prompt_fast(body_text, user_prompt):
-    """快速模式拼接：skill 指令 + 用户需求，总长受 SKILL_FAST_PROMPT_MAX 约束
+def compose_skill_prompt_fast(body_text, user_prompt, variant=None):
+    """快速模式拼接：skill 指令 + 样式变体 + 用户需求，总长受 SKILL_FAST_PROMPT_MAX 约束
     （ModelScope 等上游 prompt 上限约 4000，实测验收发现超限被拒）。"""
     instruction = re.sub(r"\s+", " ", str(body_text or "")).strip()
     prompt_text = str(user_prompt or "").strip()
     prefix = "请严格按照以下 Skill 指令生成图像。Skill 指令："
-    middle = " 用户需求："
+    variant_text = ""
+    if variant and (variant.get("prompt") or variant.get("label")):
+        variant_text = f" 本次必须采用样式变体「{variant.get('label') or variant.get('id')}」：{str(variant.get('prompt') or '').strip()}"
+    middle = f"{variant_text} 用户需求："
     budget = max(500, SKILL_FAST_PROMPT_MAX - len(prefix) - len(middle) - len(prompt_text))
     if len(instruction) > budget:
         instruction = instruction[:budget].rstrip() + "…（Skill 指令超出长度上限，已截取核心部分）"
@@ -20158,6 +20236,8 @@ async def compile_skill_prompt(selection, user_prompt):
     if not os.path.isfile(os.path.join(dir_path, "SKILL.md")):
         raise HTTPException(status_code=400, detail=f"Skill 缺少 SKILL.md，无法编译：{selection.id}")
     entry = skill_entry_from_dir(dir_path, source, include_body=True)
+    variants = entry.get("variants") or []
+    variant = next((v for v in variants if str(v.get("id") or "") == str(selection.variant or "").strip()), None)
     snapshot = skill_content_snapshot(dir_path)
     skill_used = {
         "id": entry["id"],
@@ -20166,9 +20246,10 @@ async def compile_skill_prompt(selection, user_prompt):
         "sha": snapshot,
         "mode": mode,
         "version": entry.get("version") or "",
+        "variant": {"id": variant["id"], "label": variant.get("label") or ""} if variant else None,
     }
     if mode == "fast":
-        return {"compiled_prompt": compose_skill_prompt_fast(entry.get("body") or "", user_prompt), "skill_used": skill_used, "cached": False}
+        return {"compiled_prompt": compose_skill_prompt_fast(entry.get("body") or "", user_prompt, variant), "skill_used": skill_used, "cached": False}
     provider = str(selection.provider or "").strip() or get_primary_provider_id()
     llm_model = str(selection.model or "").strip()
     # 缓存 key 含 provider/model：切换 LLM 平台不会命中旧平台结果（审查 P2-2）
@@ -20180,7 +20261,11 @@ async def compile_skill_prompt(selection, user_prompt):
         if isinstance(hit, dict) and hit.get("compiled_prompt"):
             return {"compiled_prompt": str(hit["compiled_prompt"]), "skill_used": skill_used, "cached": True}
         skill_body = (entry.get("body") or "").strip()[:8000]
-        message = f"SKILL 指令：\n{skill_body}\n\n用户需求：{str(user_prompt or '').strip()}"
+        variant_directive = ""
+        if variant and (variant.get("prompt") or variant.get("label")):
+            variant_directive = f"\n\n本次必须采用样式变体「{variant.get('label') or variant.get('id')}」：{str(variant.get('prompt') or '').strip()}"
+        user_part = str(user_prompt or "").strip() or "（无附加文字需求，按 SKILL 指令处理所给参考图）"
+        message = f"SKILL 指令：\n{skill_body}{variant_directive}\n\n用户需求：{user_part}"
         if len(message) > LLM_MESSAGE_MAX_LENGTH:
             raise HTTPException(status_code=400, detail=f"提示词过长（{len(message)} > {LLM_MESSAGE_MAX_LENGTH}），请缩短用户需求或 Skill 正文")
         llm_payload = CanvasLLMRequest(
@@ -20216,17 +20301,18 @@ class SkillPreviewRequest(BaseModel):
     source: str = "custom"
     id: str = Field(min_length=1, max_length=80)
     mode: str = "fast"
-    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    variant: str = ""
+    prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
 
 @app.post("/api/skills/preview-prompt")
 async def api_skill_preview_prompt(payload: SkillPreviewRequest):
-    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode)
+    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant)
     return skill_diff_for_preview(selection, payload.prompt)
 
 @app.post("/api/skills/compile-prompt")
 async def api_skill_compile_prompt(payload: SkillPreviewRequest):
     """智能模式的真实编译预览（走 LLM，结果进缓存；调用会消耗 LLM 额度）。"""
-    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode)
+    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant)
     result = await compile_skill_prompt(selection, payload.prompt)
     return result
 
