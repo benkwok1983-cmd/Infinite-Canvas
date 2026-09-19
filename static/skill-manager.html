@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/static/images/logo.png" type="image/png">
+    <title>Skill 库管理</title>
+    <script>
+        (function(){
+            try {
+                var theme = localStorage.getItem('studio_theme') || localStorage.getItem('canvas_theme') || 'light';
+                if(theme === 'dark') {
+                    document.documentElement.classList.add('studio-theme-dark');
+                    document.documentElement.classList.add('theme-dark');
+                }
+            } catch(e) {}
+        })();
+    </script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.28.1788924938"></script>
+    <script src="/static/js/theme.js?v=2026.08.28.1788924902"></script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.28.1788924798">
+    <link rel="stylesheet" href="/static/css/skill-manager.css?v=2026.08.28.1789789420">
+</head>
+<body>
+    <div class="skill-page">
+        <header class="skill-page-head">
+            <div>
+                <div class="skill-title">Skill 库管理</div>
+                <div class="skill-sub">导入 GitHub 开源 Skill 或自建风格包，供画布生图时按风格编译提示词。Skill 是指令文档，脚本永不执行。</div>
+            </div>
+            <div class="skill-head-actions">
+                <div id="skillStatus" class="skill-status">准备就绪</div>
+                <button id="skillCreateBtn" class="skill-btn" type="button"><i data-lucide="plus"></i><span>新建</span></button>
+                <button id="skillGithubBtn" class="skill-btn primary" type="button"><i data-lucide="github"></i><span>GitHub 导入</span></button>
+                <button id="skillZipBtn" class="skill-btn" type="button"><i data-lucide="file-archive"></i><span>导入 zip</span></button>
+                <button id="skillRefreshBtn" class="skill-btn" type="button"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+            </div>
+        </header>
+
+        <div class="skill-tabs" id="skillTabs">
+            <button class="active" type="button" data-source="custom"><i data-lucide="folder-heart"></i><span>我的 Skill</span></button>
+            <button type="button" data-source="builtin"><i data-lucide="package"></i><span>内置</span></button>
+            <button type="button" data-source="codex"><i data-lucide="terminal"></i><span>Codex（只读）</span></button>
+        </div>
+
+        <main id="skillGrid" class="skill-grid"></main>
+    </div>
+
+    <input id="skillZipInput" type="file" accept=".zip,application/zip" hidden>
+
+    <!-- 详情弹层 -->
+    <div id="skillDetailOverlay" class="skill-overlay" hidden>
+        <div class="skill-modal wide">
+            <div class="skill-modal-head">
+                <div class="skill-modal-title" id="skillDetailTitle">详情</div>
+                <button class="skill-icon-btn" type="button" data-close="skillDetailOverlay"><i data-lucide="x"></i></button>
+            </div>
+            <div class="skill-modal-body" id="skillDetailBody"></div>
+        </div>
+    </div>
+
+    <!-- 新建/编辑弹层 -->
+    <div id="skillEditOverlay" class="skill-overlay" hidden>
+        <div class="skill-modal wide">
+            <div class="skill-modal-head">
+                <div class="skill-modal-title" id="skillEditTitle">新建 Skill</div>
+                <button class="skill-icon-btn" type="button" data-close="skillEditOverlay"><i data-lucide="x"></i></button>
+            </div>
+            <div class="skill-modal-body">
+                <div id="skillEditNameRow" class="skill-form-row">
+                    <label class="skill-form-label">名称</label>
+                    <input id="skillEditName" class="skill-input" type="text" maxlength="64" placeholder="例如：水彩插画风格">
+                    <div class="skill-form-hint" id="skillEditNameHint">自动转为小写 ID（字母/数字/._-）</div>
+                </div>
+                <div id="skillEditDescRow" class="skill-form-row">
+                    <label class="skill-form-label">描述</label>
+                    <input id="skillEditDesc" class="skill-input" type="text" maxlength="400" placeholder="一句话说明这个 Skill 的用途">
+                </div>
+                <div class="skill-form-row">
+                    <label class="skill-form-label">SKILL.md 内容</label>
+                    <textarea id="skillEditContent" class="skill-textarea" rows="16" placeholder="编写该风格的使用指令（供生图改写流程读取）。保存后正文会追加到自动生成的 frontmatter 之后。"></textarea>
+                    <div class="skill-form-hint" id="skillEditContentHint"></div>
+                </div>
+                <div class="skill-modal-actions">
+                    <button class="skill-btn" type="button" data-close="skillEditOverlay"><span>取消</span></button>
+                    <button id="skillEditSave" class="skill-btn primary" type="button"><i data-lucide="save"></i><span>保存</span></button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- GitHub 导入弹层 -->
+    <div id="skillGithubOverlay" class="skill-overlay" hidden>
+        <div class="skill-modal">
+            <div class="skill-modal-head">
+                <div class="skill-modal-title">从 GitHub 导入 Skill</div>
+                <button class="skill-icon-btn" type="button" data-close="skillGithubOverlay"><i data-lucide="x"></i></button>
+            </div>
+            <div class="skill-modal-body">
+                <div id="ghStepUrl">
+                    <div class="skill-form-row">
+                        <label class="skill-form-label">仓库地址</label>
+                        <input id="ghUrl" class="skill-input" type="text" placeholder="https://github.com/{owner}/{repo}">
+                        <div class="skill-form-hint">支持仓库根目录含 SKILL.md，或"一仓库多 Skill"的 monorepo（届时指定子目录）</div>
+                    </div>
+                    <div class="skill-form-row two-col">
+                        <div>
+                            <label class="skill-form-label">分支 / Tag / SHA（可选）</label>
+                            <input id="ghRef" class="skill-input" type="text" placeholder="留空 = 默认分支">
+                        </div>
+                        <div>
+                            <label class="skill-form-label">子目录（monorepo 时填写）</label>
+                            <input id="ghSubdir" class="skill-input" type="text" placeholder="例如 skills/watercolor">
+                        </div>
+                    </div>
+                    <div class="skill-modal-actions">
+                        <button class="skill-btn" type="button" data-close="skillGithubOverlay"><span>取消</span></button>
+                        <button id="ghPreviewBtn" class="skill-btn primary" type="button"><i data-lucide="search"></i><span>获取预览</span></button>
+                    </div>
+                </div>
+                <div id="ghStepConfirm" hidden>
+                    <div class="gh-confirm-box" id="ghConfirmBox"></div>
+                    <div class="skill-form-row two-col">
+                        <div>
+                            <label class="skill-form-label">安装名称（ID）</label>
+                            <input id="ghInstallName" class="skill-input" type="text" maxlength="64">
+                        </div>
+                        <label class="skill-check-row" id="ghOverwriteRow" hidden>
+                            <input id="ghOverwrite" type="checkbox">
+                            <span>覆盖已存在的同名 Skill</span>
+                        </label>
+                    </div>
+                    <div class="skill-modal-actions">
+                        <button class="skill-btn" type="button" id="ghBackBtn"><span>上一步</span></button>
+                        <button id="ghInstallBtn" class="skill-btn primary" type="button"><i data-lucide="download"></i><span>确认安装</span></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 更新检查弹层 -->
+    <div id="skillUpdateOverlay" class="skill-overlay" hidden>
+        <div class="skill-modal">
+            <div class="skill-modal-head">
+                <div class="skill-modal-title">检查更新</div>
+                <button class="skill-icon-btn" type="button" data-close="skillUpdateOverlay"><i data-lucide="x"></i></button>
+            </div>
+            <div class="skill-modal-body">
+                <div id="skillUpdateBox" class="gh-confirm-box"></div>
+                <div class="skill-modal-actions">
+                    <button class="skill-btn" type="button" data-close="skillUpdateOverlay"><span>关闭</span></button>
+                    <button id="skillUpgradeBtn" class="skill-btn primary" type="button" hidden><i data-lucide="arrow-up-circle"></i><span>升级到最新</span></button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="skillToast" class="skill-toast"></div>
+    <script src="/static/js/skill-manager.js?v=2026.08.28.1789786707"></script>
+</body>
+</html>
