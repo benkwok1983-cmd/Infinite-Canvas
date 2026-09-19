@@ -1562,6 +1562,18 @@ os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
 
+@app.get("/static/{page_name}", include_in_schema=False)
+async def static_page_no_cache(page_name: str):
+    """子页面 HTML 禁缓存（StaticFiles 响应会被浏览器启发式缓存，改版后用户拿不到新页面）；
+    js/css/images 等多段路径仍走 StaticFiles（靠 ?v= 版本戳缓存）。
+    注意：必须注册在 mount 之前，否则被 StaticFiles 先匹配。"""
+    if page_name.lower().endswith(".html"):
+        return static_html_response(page_name)
+    path = os.path.join(STATIC_DIR, page_name)
+    if os.path.isfile(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Not Found")
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
