@@ -25,7 +25,12 @@
 - **fast 模式（推荐，用 ModelScope 免费模型，零 Codex 额度）**：画布创建生成节点（MS 生成）→ 连接 Skill 节点（选 algorithmic-art 或自建）→ 简单提示词生成 → 验收：出图风格体现 skill 影响；生成日志 run.request 含 skill_used
 - **llm 模式（消耗少量 LLM 额度）**：同上但 Skill 节点切「智能」→ 生成 → 验收：编译提示词明显融合改写；同组合第二次生成命中缓存（data/skill_compile_cache.json 出现条目且不再调 LLM）
 
-## 4. 验收后收尾（助手执行）
+## 4. AI 识别样板验证（少量订阅聊天额度，非生图）
+
+管理页 → 编辑任意 Skill → 点「AI 识别样板」→ 等待 LLM 分析（走 Codex 聊天通道）→ 识别结果填入样板表格 → 删改后保存 → 画布 Skill 节点下拉出现样板。
+前置：额度重置；当前 ModelScope 免费聊天通道对该账户模型报 no provider supported（平台侧，建议顺便检查 MODELSCOPE_CHAT_MODELS 配置）。
+
+## 5. 验收后收尾（助手执行）
 
 - 若 2.5 被确认 → 更新 UI 标注（去「实验」字样）与 PRD
 - 更新 docs/zcode/log/PHASE6-progress.md 验收记录、WORKPLAN 全表勾结
