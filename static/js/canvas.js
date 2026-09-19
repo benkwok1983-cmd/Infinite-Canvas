@@ -3122,22 +3122,6 @@ async function runMsGenNode(nodeId, opts={}){
     const msLoras = modelscopeLorasForModel(msModelId);
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
     if(msModel.supportsImage && !refs.length){ alert(tr('canvas.needImage')); return; }
-    // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）。
-    // 提示词可选：有参考图 + skill 即可生图（编译产物=skill 指令与所选样板）
-    let skillUsed = null;
-    if(skillSource){
-        try {
-            const compiled = await fetch('/api/skills/compile-prompt', {
-                method:'POST', headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', prompt})
-            }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
-            prompt = compiled.compiled_prompt;
-            skillUsed = {...compiled.skill_used, cached:compiled.cached};
-        } catch(err) {
-            alert((err.message || tr('canvas.generationFailed')).slice(0, 220));
-            return;
-        }
-    }
     const count = Math.max(1, Math.min(8, Number(node.count || 1)));
     // 链路中间节点默认不创建 Output；链尾、手动开启或已有 Output 连接时才输出。
     let out = outputForNode(node, 460);
@@ -3152,6 +3136,8 @@ async function runMsGenNode(nodeId, opts={}){
         height = Number(node.msHeight) || height;
     }
     const requestSize = {width, height};
+    // 转圈卡片必须先于 Skill 编译创建：智能模式的 LLM 编译可能耗时 10-60s，
+    // 否则点击生成后长时间无任何反馈（用户实测反馈）。
     if(out) out._pending = [...(out._pending || []), ...pendingIds.map(id => makePendingForRun(id, run, node, {refs, requestSize, cascadeTargetId}))];
     if(!opts.cascade){
         node.running = true;
@@ -3159,6 +3145,28 @@ async function runMsGenNode(nodeId, opts={}){
         setTimeout(() => { node.running = false; refreshRunNodes(node, out); }, 2000);
     }
     else refreshRunNodes(node, out);
+    // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）。
+    // 提示词可选：有参考图 + skill 即可生图（编译产物=skill 指令与所选样板）
+    let skillUsed = null;
+    if(skillSource){
+        try {
+            const compiled = await fetch('/api/skills/compile-prompt', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', prompt})
+            }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
+            prompt = compiled.compiled_prompt;
+            skillUsed = {...compiled.skill_used, cached:compiled.cached};
+            run.prompt = prompt;
+        } catch(err) {
+            // 编译失败：回收刚创建的转圈卡片并落日志，保持与生成失败同样的反馈
+            if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
+            node.running = false;
+            refreshRunNodes(node, out);
+            addGenerationLog({run, outputs:[], runMs:0, error:err.message || String(err)});
+            alert((err.message || tr('canvas.generationFailed')).slice(0, 220));
+            return;
+        }
+    }
     try {
         const imageUrls = [];
         if(msModel.supportsImage || msModel.acceptsImage){
