@@ -129,6 +129,40 @@ class SkillZipSafetyTests(unittest.TestCase):
         self.assertIsNone(skipped)
         self.assertTrue(os.path.isfile(os.path.join(root, "SKILL.md")))
 
+    def test_swap_staged_into_target_rollback_on_move_failure(self):
+        target = make_skill_dir(self.root, name="target", with_md=True)
+        old_md = (Path(target) / "SKILL.md").read_text(encoding="utf-8")
+        staged = make_skill_dir(self.root, name="staged", with_md=True)
+        (Path(staged) / "SKILL.md").write_text("---\nname: staged\n---\nnew", encoding="utf-8")
+        real_move = main.shutil.move
+        def failing_move(src, dst, *a, **k):
+            if str(dst) == str(target):
+                raise OSError("simulated av lock")
+            return real_move(src, dst, *a, **k)
+        with patch.object(main.shutil, "move", failing_move):
+            with self.assertRaises(OSError):
+                main.swap_staged_into_target(staged, target)
+        # 旧目录自动恢复、无备份残留
+        self.assertTrue((Path(target) / "SKILL.md").read_text(encoding="utf-8") == old_md)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".target.install-bak")))
+
+    def test_swap_staged_into_target_success_replaces(self):
+        target = make_skill_dir(self.root, name="t2", with_md=True)
+        staged = make_skill_dir(self.root, name="s2", with_md=True)
+        (Path(staged) / "SKILL.md").write_text("---\nname: t2\n---\nreplaced", encoding="utf-8")
+        backup_left, replaced = main.swap_staged_into_target(staged, target)
+        self.assertTrue(replaced)
+        self.assertFalse(backup_left)
+        self.assertIn("replaced", (Path(target) / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_validate_rejects_oversized_skill_md(self):
+        src = make_skill_dir(self.root, name="big", with_md=True)
+        (Path(src) / "SKILL.md").write_text("x" * (main.SKILLS_MAX_SKILL_MD_BYTES + 1), encoding="utf-8")
+        staged = os.path.join(self.root, "staged-big")
+        with self.assertRaises(main.HTTPException) as ctx:
+            main.validate_and_stage_skill(src, staged)
+        self.assertEqual(ctx.exception.status_code, 400)
+
     def test_safe_extract_skips_large_files_but_keeps_skill_md(self):
         big = "x" * (main.SKILLS_SKIP_FILE_BYTES + 1024)
         zip_path = self._zip([
@@ -249,6 +283,29 @@ class SkillsApiTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 200)
         gone = self.client.get(f"/api/skills/custom/{skill_id}")
         self.assertEqual(gone.status_code, 404)
+
+    def test_allow_api_fallback_put_get_roundtrip(self):
+        # 校审 P1-2 回归：保存开关后重新 GET 应保持 true
+        current = self.client.get("/api/providers").json()["providers"]
+        payload = []
+        for p in current:
+            item = dict(p)
+            item.pop("has_key", None); item.pop("key_preview", None); item.pop("key_env", None)
+            item.pop("has_wallet_key", None); item.pop("wallet_key_preview", None); item.pop("wallet_key_env", None)
+            item.pop("has_volcengine_access_key", None); item.pop("volcengine_access_key_preview", None)
+            item.pop("has_volcengine_secret_access_key", None); item.pop("volcengine_secret_access_key_preview", None)
+            if item.get("id") == "codex":
+                item["allow_api_fallback"] = True
+            payload.append(item)
+        put = self.client.put("/api/providers", json=payload)
+        self.assertEqual(put.status_code, 200, put.text[:200])
+        after = {p["id"]: p for p in self.client.get("/api/providers").json()["providers"]}
+        self.assertTrue(after["codex"]["allow_api_fallback"] is True)
+        # 还原为 False，避免影响其他用例/真实配置
+        for item in payload:
+            if item.get("id") == "codex":
+                item["allow_api_fallback"] = False
+        self.client.put("/api/providers", json=payload)
 
     def test_create_rejects_unusable_name(self):
         # 纯符号名规范化后为空 → 400

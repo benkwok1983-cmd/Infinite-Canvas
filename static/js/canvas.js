@@ -8531,7 +8531,7 @@ async function previewCompiledPrompt(gen, promptText){
     try {
         const data = await fetch('/api/skills/compile-prompt', {
             method:'POST', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({source:skillNode.skillSource || 'custom', id:skillNode.skillId, mode, prompt:promptText})
+            body:JSON.stringify({source:skillNode.skillSource || 'custom', id:skillNode.skillId, mode, variant:skillNode.skillVariant || '', model:skillNode.skillModel || '', prompt:promptText})
         }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
         const suffix = data.mode === 'llm' ? (data.cached ? tr('canvas.skillCacheHit') : '') : '';
         showPromptPreviewModal(`${tr('canvas.skillPreview')} · ${skillNode.skillName || skillNode.skillId}${suffix}`, data.compiled_prompt || '');
@@ -11572,9 +11572,11 @@ async function runGenerator(genId, opts={}){
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
     const count = Math.max(1, Math.min(8, Number(gen.count || 1)));
     let out = outputForNode(gen, 460);
-    const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
+    // 有 Skill 时提示词可选（校审 P1-4）：空提示词交给 Skill 编译驱动；无 Skill 保持原 fallback
+    const effectivePrompt = (skillSource && !prompt) ? '' : (prompt || 'Edit the reference images.');
+    const run = runSnapshot(gen, effectivePrompt, refs);
     const payload = {
-        prompt: prompt || 'Edit the reference images.',
+        prompt: effectivePrompt,
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
         image_model:isExperimentalCodexImageModel(resolveImageModel(gen.model)) ? resolveImageModel(gen.model) : '',

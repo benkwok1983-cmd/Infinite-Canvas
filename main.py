@@ -2817,7 +2817,8 @@ class SkillSelection(BaseModel):
     model: str = ""
 
 class OnlineImageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    # 提示词可选（校审 P1-4）：空提示词时要求 Skill 或参考图至少其一，业务层校验
+    prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
     provider_id: str = "comfly"
     model: str = ""
     image_model: str = ""
@@ -5584,7 +5585,6 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             "--json",
         ]
         args.extend(attempt_provider_args)
-        print(f"[codex-image] attempt={attempt_provider} mode={mode} FULL_ARGV={json.dumps(args, ensure_ascii=False)}")
         args.extend([
             "images",
             mode,
@@ -14273,6 +14273,9 @@ async def build_online_image_result(payload: OnlineImageRequest):
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     operation = str(payload.operation or "").strip().lower()
+    # 业务校验（校审 P1-4）：提示词 / Skill / 参考图 至少其一；纯空请求拒绝
+    if not str(payload.prompt or "").strip() and not (payload.skill and str(payload.skill.id or "").strip()) and not refs:
+        raise HTTPException(status_code=400, detail="请提供提示词、连接 Skill 节点或参考图——三者至少其一")
     # Skill 编译注入（PRD FR2-6/FR2-7）：所有 provider 共享此入口；无 skill 时请求与原流程完全一致。
     # upscale（图片放大）不走提示词，跳过编译（审查 P2-5）。
     skill_used = None
@@ -19358,6 +19361,7 @@ SKILLS_ZIP_STREAM_MAX_BYTES = 120 * 1024 * 1024
 # 跳过它们才能导入含大量示例图的超大 skill 仓库（如 mono-color-skill 72MB）。
 SKILLS_SKIP_FILE_BYTES = 2 * 1024 * 1024
 SKILLS_SCRIPT_EXTS = {".py", ".sh", ".js", ".mjs", ".cjs", ".cmd", ".bat", ".ps1", ".exe", ".dll"}
+SKILLS_MAX_SKILL_MD_BYTES = 1024 * 1024
 
 try:
     import yaml as _skill_yaml
@@ -19933,6 +19937,26 @@ def locate_skill_root(extracted_root, subdir=""):
     listing = "、".join(os.path.relpath(c, extracted_root).replace("\\", "/") for c in candidates[:5])
     raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}）。请通过 subdir 参数指定目标 Skill 所在的子目录后重试。")
 
+def swap_staged_into_target(staged, target):
+    """事务性覆盖安装（校审 P1-6）：旧目录先改名为隐藏备份，staged 移入成功且元数据
+    写入后才清理备份；move 失败自动恢复旧目录。返回 (backup_left, replaced)。"""
+    backup = os.path.join(os.path.dirname(target), "." + os.path.basename(target) + ".install-bak")
+    if os.path.exists(backup):
+        shutil.rmtree(backup, ignore_errors=True)
+    replaced = os.path.exists(target)
+    if replaced:
+        os.rename(target, backup)
+    try:
+        shutil.move(staged, target)
+    except Exception:
+        if replaced:
+            os.rename(backup, target)
+        raise
+    if replaced:
+        shutil.rmtree(backup, ignore_errors=True)
+        return os.path.exists(backup), True
+    return False, False
+
 def append_skip_warning(entry, skipped):
     """把大文件跳过信息追加为 skill 条目的 warning（预览/zip 导入路径）。"""
     if skipped and isinstance(entry, dict):
@@ -19946,6 +19970,9 @@ def validate_and_stage_skill(skill_root, staged_root):
     entry = skill_entry_from_dir(staged_root, "custom", include_body=False)
     if not entry["has_skill_md"]:
         raise HTTPException(status_code=400, detail="目标目录缺少 SKILL.md，不能作为 Skill 安装")
+    skill_md_size = os.path.getsize(os.path.join(staged_root, "SKILL.md"))
+    if skill_md_size > SKILLS_MAX_SKILL_MD_BYTES:
+        raise HTTPException(status_code=400, detail=f"SKILL.md 超过 {SKILLS_MAX_SKILL_MD_BYTES // 1024}KB 上限（当前 {skill_md_size // 1024}KB）")
     return entry
 
 @app.post("/api/skills/github/preview")
@@ -19999,11 +20026,10 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
             if not SKILL_ID_RE.match(skill_id):
                 raise HTTPException(status_code=400, detail=f"从 SKILL.md/仓库名推导的 ID 不合法：{skill_id[:60]}，请手动指定名称")
             target = os.path.join(skill_source_root("custom"), skill_id)
-            if os.path.exists(target):
-                if not payload.overwrite:
-                    raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
-                shutil.rmtree(target)
-            shutil.move(staged, target)
+            if os.path.exists(target) and not payload.overwrite:
+                raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
+            # 事务性覆盖（校审 P1-6/P2）：失败自动恢复旧目录
+            backup_left, replaced = swap_staged_into_target(staged, target)
             meta_written = skill_write_meta(target, {
                 "source": "github",
                 "repo_url": f"https://github.com/{info['owner']}/{info['repo']}",
@@ -20016,6 +20042,8 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
             warnings = []
             if skipped:
                 warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
+            if replaced and backup_left:
+                warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.install-bak")
             if not meta_written:
                 warnings.append("安装元数据写入失败，后续更新检查不可用")
             if warnings:
@@ -20061,15 +20089,18 @@ async def api_skill_zip_install(file: UploadFile = File(...), overwrite: bool = 
             if not SKILL_ID_RE.match(skill_id):
                 raise HTTPException(status_code=400, detail=f"从 SKILL.md 推导的 ID 不合法：{skill_id[:60]}")
             target = os.path.join(skill_source_root("custom"), skill_id)
-            if os.path.exists(target):
-                if not overwrite:
-                    raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
-                shutil.rmtree(target)
-            shutil.move(staged, target)
+            if os.path.exists(target) and not overwrite:
+                raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
+            backup_left, replaced = swap_staged_into_target(staged, target)
             meta_written = skill_write_meta(target, {"source": "zip", "installed_at": now_ms()})
             result = {"ok": True, "id": skill_id, "skill": skill_entry_from_dir(target, "custom")}
+            warnings = []
+            if replaced and backup_left:
+                warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.install-bak")
             if not meta_written:
-                result["warnings"] = ["安装元数据写入失败，不影响使用"]
+                warnings.append("安装元数据写入失败，不影响使用")
+            if warnings:
+                result["warnings"] = warnings
             return result
     finally:
         try:
@@ -20178,12 +20209,15 @@ def skill_compile_cache_load():
         return {}
 
 def skill_compile_cache_save(cache):
+    """临时文件 + 原子替换：并发/异常不会留下半截 JSON（校审 P2：缓存文件损坏防护）。"""
     try:
         if len(cache) > SKILL_COMPILE_CACHE_LIMIT:
             trimmed = sorted(cache.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:SKILL_COMPILE_CACHE_LIMIT]
             cache = dict(trimmed)
-        with open(SKILL_COMPILE_CACHE_FILE, "w", encoding="utf-8") as f:
+        tmp_path = SKILL_COMPILE_CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp_path, SKILL_COMPILE_CACHE_FILE)
     except Exception:
         pass
 
@@ -20253,8 +20287,9 @@ async def compile_skill_prompt(selection, user_prompt):
         # 智能模式默认走 Codex 聊天通道（订阅额度、成本低）；primary 可能是纯生图平台
         provider = "codex" if any(p.get("protocol") == "codex" and p.get("enabled", True) for p in load_api_providers()) else get_primary_provider_id()
     llm_model = str(selection.model or "").strip()
-    # 缓存 key 含 provider/model：切换 LLM 平台不会命中旧平台结果（审查 P2-2）
-    key = hashlib.sha256(f"{snapshot}|{mode}|{provider}|{llm_model}|{user_prompt}".encode("utf-8")).hexdigest()
+    # 缓存 key 含 provider/model（切换 LLM 平台不串用）与 variant（切样板不串用——校审 P1-3）
+    variant_part = f"{variant.get('id') or ''}|{variant.get('prompt') or ''}" if variant else "-"
+    key = hashlib.sha256(f"{snapshot}|{mode}|{provider}|{llm_model}|{str(selection.variant or '').strip()}|{variant_part}|{user_prompt}".encode("utf-8")).hexdigest()
     # 同 key 并发（generator count>1）串行化：后到者直接命中先到者写入的缓存（审查 P2-3）
     async with skill_compile_lock(key):
         cache = skill_compile_cache_load()

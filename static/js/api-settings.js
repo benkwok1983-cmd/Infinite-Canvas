@@ -3796,6 +3796,7 @@ async function saveProviders(){
                 volcengine_region:item.id === 'volcengine' ? (item.volcengine_region || VOLCENGINE_DEFAULT_REGION) : '',
                 volcengine_access_key_id:item.volcengine_access_key_id || undefined,
                 volcengine_secret_access_key:item.volcengine_secret_access_key || undefined,
+                allow_api_fallback:(String(item.protocol || '').toLowerCase() === 'codex') ? Boolean(item.allow_api_fallback) : false,
                 api_key:item.api_key || undefined,
                 wallet_api_key:item.wallet_api_key || undefined,
                 clear_key:item._clearKey === true,

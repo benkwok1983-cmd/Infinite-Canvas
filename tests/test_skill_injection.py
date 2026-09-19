@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main
@@ -37,12 +36,9 @@ class SkillInjectionTests(unittest.TestCase):
             p.stop()
         self.tmp.cleanup()
 
-    def test_fast_compile_truncates_to_upstream_limit(self):
-        async def run():
-            result = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="fast"), "short prompt")
-            return result["compiled_prompt"]
-        compiled = self._run(run())
-        self.assertLessEqual(len(compiled), main.SKILL_FAST_PROMPT_MAX + 50)
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
 
     def test_fast_compile_composes_body_and_prompt(self):
         async def run():
@@ -54,6 +50,23 @@ class SkillInjectionTests(unittest.TestCase):
         self.assertEqual(result["skill_used"]["id"], "style-a")
         self.assertEqual(result["skill_used"]["mode"], "fast")
         self.assertTrue(result["skill_used"]["sha"])
+
+    def test_fast_compile_truncates_to_upstream_limit(self):
+        async def run():
+            result = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="fast"), "short prompt")
+            return result["compiled_prompt"]
+        compiled = self._run(run())
+        self.assertLessEqual(len(compiled), main.SKILL_FAST_PROMPT_MAX + 50)
+
+    def test_fast_compile_applies_variant_directive(self):
+        (Path(self.custom_dir) / "style-a" / "SKILL.md").write_text(
+            "---\nname: style-a\nversion: 1.0\nvariants:\n  - id: va\n    label: VA\n    prompt: VA-style directive\n---\n\nBody\n",
+            encoding="utf-8")
+        async def run():
+            return await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="fast", variant="va"), "short prompt")
+        result = self._run(run())
+        self.assertIn("VA-style directive", result["compiled_prompt"])
+        self.assertEqual(result["skill_used"]["variant"]["id"], "va")
 
     def test_different_skills_produce_different_prompts(self):
         async def run():
@@ -71,10 +84,9 @@ class SkillInjectionTests(unittest.TestCase):
             return {"text": f"compiled #{calls['n']}", "model": "fake", "raw_usage": None}
 
         async def run():
-            with patch.object(main, "canvas_llm", fake_canvas_llm):
-                with patch.object(main, "get_primary_provider_id", return_value="comfly"):
-                    first = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm"), "same prompt")
-                    second = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm"), "same prompt")
+            with patch.object(main, "canvas_llm", fake_canvas_llm), patch.object(main, "get_primary_provider_id", return_value="comfly"):
+                first = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm"), "same prompt")
+                second = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm"), "same prompt")
             return first, second
         first, second = self._run(run())
         self.assertEqual(calls["n"], 1)
@@ -97,6 +109,32 @@ class SkillInjectionTests(unittest.TestCase):
                 await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm"), "same prompt")
         self._run(run())
         self.assertEqual(calls["n"], 2)
+
+    def test_llm_cache_varies_by_variant(self):
+        # 校审 P1-3 回归：切换样板不得命中对方缓存（同 skill/同提示词/同模型）
+        (Path(self.custom_dir) / "style-a" / "SKILL.md").write_text(
+            "---\nname: style-a\nversion: 1.0\nvariants:\n  - id: va\n    label: VA\n    prompt: VA-style directive\n  - id: vb\n    label: VB\n    prompt: VB-style directive\n---\n\nBody\n",
+            encoding="utf-8")
+        calls = []
+        async def fake_canvas_llm(payload):
+            calls.append(payload.message)
+            return {"text": f"compiled-{len(calls)}", "model": "fake", "raw_usage": None}
+        async def run():
+            with patch.object(main, "canvas_llm", fake_canvas_llm), patch.object(main, "get_primary_provider_id", return_value="comfly"):
+                a = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm", variant="va"), "same prompt")
+                b = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm", variant="vb"), "same prompt")
+                a2 = await main.compile_skill_prompt(main.SkillSelection(source="custom", id="style-a", mode="llm", variant="va"), "same prompt")
+            return a, b, a2
+        first, second, again = self._run(run())
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(first["cached"])
+        self.assertFalse(second["cached"])
+        self.assertTrue(again["cached"])
+        self.assertIn("VA-style directive", calls[0])
+        self.assertIn("VB-style directive", calls[1])
+        self.assertNotEqual(first["compiled_prompt"], second["compiled_prompt"])
+        self.assertEqual(first["skill_used"]["variant"]["id"], "va")
+        self.assertEqual(second["skill_used"]["variant"]["id"], "vb")
 
     def test_build_online_image_result_injects_compiled_prompt(self):
         captured = {}
@@ -144,9 +182,33 @@ class SkillInjectionTests(unittest.TestCase):
         self.assertNotIn("skill_used", result)
         self.assertNotIn("compiled_prompt", result)
 
-    def _run(self, coro):
-        import asyncio
-        return asyncio.run(coro)
+    def test_build_online_image_result_empty_prompt_with_skill_ok(self):
+        # 校审 P1-4 回归：参考图 + Skill 无提示词可生图（API 生成节点）
+        captured = {}
+        async def fake_generate_ai_image(prompt, size, quality, model, refs, provider_id, aspect_ratio="", resolution="", image_model=""):
+            captured["prompt"] = prompt
+            return {"type": "url", "value": "/output/fake.png"}, {"images": ["/output/fake.png"]}
+        async def run():
+            payload = main.OnlineImageRequest(prompt="", provider_id="comfly", size="1024x1024",
+                skill=main.SkillSelection(source="custom", id="style-a", mode="fast"))
+            with patch.object(main, "get_api_provider", return_value={"id": "comfly", "image_models": ["m1"], "name": "Comfly"}), \
+                 patch.object(main, "generate_ai_image", fake_generate_ai_image), \
+                 patch.object(main, "save_to_history", lambda result: None), \
+                 patch.object(main, "snap_size_to_multiple", side_effect=lambda size, step: size), \
+                 patch.object(main, "GLOBAL_LOOP", None):
+                return await main.build_online_image_result(payload)
+        result = self._run(run())
+        self.assertIn("Watercolor style", captured["prompt"])
+        self.assertEqual(result["skill_used"]["id"], "style-a")
+
+    def test_build_online_image_result_rejects_all_empty(self):
+        async def run():
+            payload = main.OnlineImageRequest(prompt="", provider_id="comfly", size="1024x1024")
+            with patch.object(main, "get_api_provider", return_value={"id": "comfly", "image_models": ["m1"], "name": "Comfly"}):
+                return await main.build_online_image_result(payload)
+        with self.assertRaises(main.HTTPException) as ctx:
+            self._run(run())
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":
