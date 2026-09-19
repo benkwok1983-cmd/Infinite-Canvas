@@ -19,6 +19,7 @@
         "canvas.skillSmartPreviewConfirm": { zh: "智能模式预览会调用 LLM 改写（消耗少量额度，结果会缓存复用）。继续？", en: "Smart preview calls the LLM (uses a little quota; result is cached). Continue?" },
         "canvas.skillCacheHit": { zh: "（缓存）", en: " (cached)" },
         "canvas.skillVariantAuto": { zh: "样板：由 Skill 自动决定", en: "Style: skill decides" },
+        "canvas.skillLlmModel": { zh: "智能模式使用的聊天模型", en: "Chat model used by smart mode" },
         "canvas.imageModelUnconfirmed": { zh: "Image 2.5 选择未被服务端确认（返回别名），实际模型以服务端路由为准", en: "Image 2.5 choice not confirmed by server (alias returned); actual model is server-routed" },
         "canvas.noModelsHint": { zh: "暂无模型，请到 API 设置添加", en: "No models. Add some in API Settings." },
         "canvas.title": { zh: "无限画布", en: "Infinite Canvas" },

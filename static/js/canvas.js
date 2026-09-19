@@ -3158,7 +3158,7 @@ async function runMsGenNode(nodeId, opts={}){
         try {
             const compiled = await fetch('/api/skills/compile-prompt', {
                 method:'POST', headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', prompt})
+                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', model:skillSource.skill.model || '', prompt})
             }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
             prompt = compiled.compiled_prompt;
             skillUsed = {...compiled.skill_used, cached:compiled.cached};
@@ -8426,6 +8426,15 @@ function skillOptionsHtml(node){
     }
     return options.join('');
 }
+function skillLlmModelOptionsHtml(node){
+    const codex = (apiProviders || []).find(p => p.id === 'codex' || String(p.protocol || '').toLowerCase() === 'codex');
+    const models = (codex?.chat_models || []).filter(Boolean);
+    if(!models.length) return '';
+    const selected = node.skillModel || models[0];
+    return `<select class="select-lite skill-llm-model-select mb-2" title="${escapeHtml(tr('canvas.skillLlmModel'))}">
+        ${models.map(m => `<option value="${escapeHtml(m)}" ${m === selected ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+    </select>`;
+}
 function skillVariantOptionsHtml(node){
     const found = skillLibraryCache.list.find(s => s.source === (node.skillSource || 'custom') && s.id === node.skillId);
     const variants = found?.variants || [];
@@ -8443,6 +8452,7 @@ function renderSkillBody(node){
     wrap.innerHTML = `
         <select class="select-lite skill-select mb-2">${skillOptionsHtml(node)}</select>
         ${skillVariantOptionsHtml(node)}
+        ${node.skillMode === 'llm' ? skillLlmModelOptionsHtml(node) : ''}
         <div class="skill-mode-row">
             <button type="button" class="skill-mode-btn ${node.skillMode !== 'llm' ? 'active' : ''}" data-mode="fast">${tr('canvas.skillFast')}</button>
             <button type="button" class="skill-mode-btn ${node.skillMode === 'llm' ? 'active' : ''}" data-mode="llm">${tr('canvas.skillSmart')}</button>
@@ -8463,6 +8473,16 @@ function renderSkillBody(node){
         scheduleSave();
         render();
     };
+    const llmModelSelect = wrap.querySelector('.skill-llm-model-select');
+    if(llmModelSelect){
+        llmModelSelect.onmousedown = e => e.stopPropagation();
+        llmModelSelect.onclick = e => e.stopPropagation();
+        llmModelSelect.onchange = e => {
+            e.stopPropagation();
+            node.skillModel = e.target.value || '';
+            scheduleSave();
+        };
+    }
     const variantSelect = wrap.querySelector('.skill-variant-select');
     if(variantSelect){
         variantSelect.onmousedown = e => e.stopPropagation();
@@ -11389,7 +11409,7 @@ function mediaRefsFromNode(node){
 function generatorSources(gen){
     return connections.filter(c => c.to === gen.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
         if(n.type === 'skill'){
-            return {id:n.id, type:'skill', label:tr('canvas.skillNode'), preview:'', refs:[], prompt:'', skill:{source:n.skillSource || 'custom', id:n.skillId, mode:n.skillMode || 'fast', variant:n.skillVariant || '', name:n.skillName || '', version:n.skillVersion || ''}};
+            return {id:n.id, type:'skill', label:tr('canvas.skillNode'), preview:'', refs:[], prompt:'', skill:{source:n.skillSource || 'custom', id:n.skillId, mode:n.skillMode || 'fast', variant:n.skillVariant || '', model:n.skillModel || '', name:n.skillName || '', version:n.skillVersion || ''}};
         }
         if(n.type === 'output' && (n.images||[]).length){
             // 从 output 节点取最新一张图当作 reference 给下游
@@ -11561,7 +11581,7 @@ async function runGenerator(genId, opts={}){
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
-    if(skillSource) payload.skill = {source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || ''};
+    if(skillSource) payload.skill = {source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', model:skillSource.skill.model || ''};
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
     let pendingIds = [];
