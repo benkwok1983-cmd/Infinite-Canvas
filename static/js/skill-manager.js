@@ -377,6 +377,25 @@ document.getElementById('skillGithubBtn').addEventListener('click', () => { rese
 document.getElementById('skillZipBtn').addEventListener('click', () => zipInput.click());
 document.getElementById('skillEditSave').addEventListener('click', saveEditor);
 document.getElementById('skillVariantAdd').addEventListener('click', () => addVariantRow());
+document.getElementById('skillVariantAi').addEventListener('click', async () => {
+    if (!editingId) { toast('请先保存 Skill 再使用 AI 识别'); return; }
+    const btn = document.getElementById('skillVariantAi');
+    const hint = document.getElementById('skillVariantAiHint');
+    btn.disabled = true;
+    hint.textContent = 'AI 正在分析该 Skill 的可用样式（免费 LLM 通道，约 10-30 秒）…';
+    try {
+        const data = await api(`/api/skills/custom/${encodeURIComponent(editingId)}/suggest-variants`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: 'custom', id: editingId, provider: 'codex' }) });
+        const suggestions = data.suggestions || [];
+        if (!suggestions.length) { hint.textContent = 'AI 未识别到可枚举的样式样板。'; return; }
+        const existing = new Set([...document.querySelectorAll('#skillVariantsList .v-label')].map(i => i.value.trim()));
+        suggestions.forEach(v => { if (!existing.has(v.label)) addVariantRow(v.label, v.prompt); });
+        hint.textContent = `AI 识别到 ${suggestions.length} 个样板，已填入（可删改后保存）`;
+    } catch (error) {
+        hint.textContent = '识别失败：' + (error.message || '').slice(0, 120);
+    } finally {
+        btn.disabled = false;
+    }
+});
 document.getElementById('ghPreviewBtn').addEventListener('click', githubPreview);
 document.getElementById('ghInstallBtn').addEventListener('click', githubInstall);
 document.getElementById('ghBackBtn').addEventListener('click', () => { document.getElementById('ghStepUrl').hidden = false; document.getElementById('ghStepConfirm').hidden = true; });

@@ -20309,6 +20309,57 @@ async def api_skill_preview_prompt(payload: SkillPreviewRequest):
     selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant)
     return skill_diff_for_preview(selection, payload.prompt)
 
+SKILL_VARIANT_SUGGEST_SYSTEM = (
+    "你是 Skill 样式分析器。阅读给定的 SKILL.md 指令，识别其中可枚举的风格样板/变体"
+    "（例如不同的墨色/配色/材质/纹理/构图家族/处理方式/输出形态）。"
+    "只提取该 Skill 明确支持或暗示的离散选项，不要发明 Skill 之外的东西。"
+    "输出严格 JSON 数组，每项形如 {\"id\": \"小写短横线英文id\", \"label\": \"中文样板名（含关键参数）\", \"prompt\": \"该样板的英文追加指令，一句话，含关键参数\"}，最多 12 项。"
+    "若该 Skill 没有可枚举的样式变体，输出 []。不要输出任何解释。"
+)
+
+class SkillVariantSuggestRequest(BaseModel):
+    provider: str = ""
+    model: str = ""
+
+@app.post("/api/skills/custom/{skill_id}/suggest-variants")
+async def api_skill_suggest_variants(skill_id: str, payload: SkillVariantSuggestRequest):
+    """用 LLM 分析 SKILL.md，自动识别可枚举的风格样板（消耗少量 LLM 额度）。"""
+    dir_path = skill_dir_for("custom", skill_id)
+    entry = skill_entry_from_dir(dir_path, "custom", include_body=True)
+    if not entry.get("has_skill_md"):
+        raise HTTPException(status_code=400, detail="缺少 SKILL.md，无法分析")
+    skill_text = (entry.get("body") or "").strip()[:8000]
+    if not skill_text:
+        raise HTTPException(status_code=400, detail="SKILL.md 正文为空，无可分析内容")
+    provider = str(payload.provider or "").strip() or get_primary_provider_id()
+    llm_payload = CanvasLLMRequest(
+        message=skill_text,
+        system_prompt=SKILL_VARIANT_SUGGEST_SYSTEM,
+        provider=provider,
+        model=str(payload.model or "").strip(),
+    )
+    result = await canvas_llm(llm_payload)
+    text = str(result.get("text") or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise HTTPException(status_code=502, detail="LLM 未返回有效的样板 JSON，请重试或改用其他 LLM 平台")
+    try:
+        items = json.loads(text[start:end + 1])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"样板 JSON 解析失败：{exc}") from exc
+    suggestions = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()[:80]
+        vprompt = str(item.get("prompt") or "").strip()[:2000]
+        vid = normalize_skill_id(str(item.get("id") or "")) or normalize_skill_id(label)
+        if not label or not vid:
+            continue
+        suggestions.append({"id": vid, "label": label, "prompt": vprompt})
+    return {"ok": True, "suggestions": suggestions[:12], "provider": provider, "model": result.get("model") or ""}
+
 @app.post("/api/skills/compile-prompt")
 async def api_skill_compile_prompt(payload: SkillPreviewRequest):
     """智能模式的真实编译预览（走 LLM，结果进缓存；调用会消耗 LLM 额度）。"""
