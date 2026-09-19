@@ -83,14 +83,16 @@ class GPTImage2SkillArgTests(unittest.TestCase):
         self.assertEqual(main.gpt_image_2_skill_size_arg("900x1600", provider="codex"), "900x1600")
 
     def test_codex_size_maps_fuzzy_one_k_to_auto(self):
-        self.assertEqual(main.gpt_image_2_skill_size_arg("1K", provider="codex"), "auto")
-        self.assertEqual(main.gpt_image_2_skill_size_arg("", prompt="1024 output", provider="codex"), "auto")
+        # 2026-09-19 实测：codex 通道 auto/2K/4K 触发 missing_image_result，收敛 1K
+        self.assertEqual(main.gpt_image_2_skill_size_arg("1K", provider="codex"), "1K")
+        self.assertEqual(main.gpt_image_2_skill_size_arg("", prompt="1024 output", provider="codex"), "1K")
 
     def test_codex_size_preserves_two_k_four_k_and_large_dimensions(self):
-        self.assertEqual(main.gpt_image_2_skill_size_arg("2K", provider="codex"), "2K")
-        self.assertEqual(main.gpt_image_2_skill_size_arg("4K", provider="codex"), "4K")
-        self.assertEqual(main.gpt_image_2_skill_size_arg("2048x1365", provider="codex"), "2K")
-        self.assertEqual(main.gpt_image_2_skill_size_arg("3840x2160", provider="codex"), "4K")
+        # auto/2K/4K 档位值 → 1K；精确宽高 → snap 到 16 倍数的精确像素（实测仅此两类被服务端接受）
+        self.assertEqual(main.gpt_image_2_skill_size_arg("2K", provider="codex"), "1K")
+        self.assertEqual(main.gpt_image_2_skill_size_arg("4K", provider="codex"), "1K")
+        self.assertEqual(main.gpt_image_2_skill_size_arg("2048x1365", provider="codex"), "2048x1376")
+        self.assertEqual(main.gpt_image_2_skill_size_arg("3840x2160", provider="codex"), "3840x2160")
 
 
 class CodexExperimentalImageModelTests(unittest.TestCase):

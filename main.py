@@ -5268,17 +5268,12 @@ def gpt_image_2_skill_size_arg(size="", model="", prompt="", provider="openai"):
         width, height = parse_size_pair(size_text)
         if 0 < max(width, height) < 1800:
             return f"{width}x{height}"
-        if "2k" in text or "2048" in text:
-            return "2K"
-        if "4k" in text or "3840" in text:
-            return "4K"
+        # 2026-09-19 实测（T1.2 补充）：codex 通道服务端只稳定接受 1K 与精确 宽x高；
+        # auto/2K/4K 档位值会触发 missing_image_result。大尺寸请求转为精确像素
+        # （snap 到 16 的倍数），小请求收敛 1K（1254x1254 级输出）。
         if width and height:
-            if max(width, height) < 3000:
-                return "2K"
-            return "4K"
-        if "1k" in text or "1024" in text:
-            return "auto"
-        return "4K"
+            return f"{(width + 15) // 16 * 16}x{(height + 15) // 16 * 16}"
+        return "1K"
     match = re.search(r"(\d{3,5})\s*[x×*]\s*(\d{3,5})", size_text, flags=re.I)
     if match:
         width = int(match.group(1))
@@ -5302,7 +5297,9 @@ def gpt_image_2_skill_size_arg(size="", model="", prompt="", provider="openai"):
     return "2K"
 
 def gpt_image_2_skill_prompt_arg(prompt="", size="", provider="openai"):
-    prompt_text = str(prompt or "").strip()
+    # gpt-image-2-skill 经 .cmd 垫片启动：cmd.exe 会在换行处重新切分参数，导致
+    # --out 等后续参数丢失（实测 2026-09-19）。prompt 必须折叠为单行。
+    prompt_text = re.sub(r"\s*\r?\n\s*", " ", str(prompt or "")).strip()
     if str(provider or "").strip().lower() != "codex":
         return prompt_text
     size_arg = gpt_image_2_skill_size_arg(size, "", prompt, provider)
@@ -5587,6 +5584,7 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             "--json",
         ]
         args.extend(attempt_provider_args)
+        print(f"[codex-image] attempt={attempt_provider} mode={mode} FULL_ARGV={json.dumps(args, ensure_ascii=False)}")
         args.extend([
             "images",
             mode,
@@ -20250,7 +20248,10 @@ async def compile_skill_prompt(selection, user_prompt):
     }
     if mode == "fast":
         return {"compiled_prompt": compose_skill_prompt_fast(entry.get("body") or "", user_prompt, variant), "skill_used": skill_used, "cached": False}
-    provider = str(selection.provider or "").strip() or get_primary_provider_id()
+    provider = str(selection.provider or "").strip()
+    if not provider:
+        # 智能模式默认走 Codex 聊天通道（订阅额度、成本低）；primary 可能是纯生图平台
+        provider = "codex" if any(p.get("protocol") == "codex" and p.get("enabled", True) for p in load_api_providers()) else get_primary_provider_id()
     llm_model = str(selection.model or "").strip()
     # 缓存 key 含 provider/model：切换 LLM 平台不会命中旧平台结果（审查 P2-2）
     key = hashlib.sha256(f"{snapshot}|{mode}|{provider}|{llm_model}|{user_prompt}".encode("utf-8")).hexdigest()
