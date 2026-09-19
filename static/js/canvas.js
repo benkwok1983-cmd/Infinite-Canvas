@@ -3120,7 +3120,7 @@ async function runMsGenNode(nodeId, opts={}){
         try {
             const compiled = await fetch('/api/skills/compile-prompt', {
                 method:'POST', headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, prompt:prompt.slice(0, 4000)})
+                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, prompt})
             }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
             prompt = compiled.compiled_prompt;
             skillUsed = {...compiled.skill_used, cached:compiled.cached};
@@ -3655,6 +3655,7 @@ function createLinkedNode(type){
 function createNodeByType(type, point){
     if(type === 'image') return addImageNode(point);
     if(type === 'prompt') return addPromptNode(point);
+    if(type === 'skill') return addSkillNode(point);
     if(type === 'loop') return addLoopNode(point);
     if(type === 'group') return addGroupNode(point);
     if(type === 'llm') return addLLMNode(point);
@@ -3673,6 +3674,7 @@ function menuAdd(type){
     closeCreateMenu();
     if(type === 'image') addImageNode(menuPoint);
     if(type === 'prompt') addPromptNode(menuPoint);
+    if(type === 'skill') addSkillNode(menuPoint);
     if(type === 'loop') addLoopNode(menuPoint);
     if(type === 'llm') addLLMNode(menuPoint);
     if(type === 'generator') addGeneratorNode(menuPoint);
@@ -6386,7 +6388,7 @@ function renderNode(node){
         startNodeDrag(e, node);
     };
     const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh','minimax'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','output'].includes(node.type);
+    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','output','skill'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
@@ -8360,6 +8362,8 @@ async function loadSkillLibrary(force=false){
         const data = await fetch('/api/skills').then(r => r.ok ? r.json() : {skills:[]});
         skillLibraryCache.list = (data.skills || []).filter(s => s.has_skill_md && ['custom','builtin'].includes(s.source));
         skillLibraryCache.loaded = true;
+        // 库异步就绪后重渲染，已选 skill 的下拉才能正确回显（审查 P2-6）
+        if(typeof nodes !== 'undefined' && nodes.some(n => n.type === 'skill')) render();
     } catch(e) {
         skillLibraryCache.list = [];
     }
@@ -8440,16 +8444,16 @@ async function previewCompiledPrompt(gen, promptText){
         showPromptPreviewModal(tr('canvas.skillPreview'), promptText || tr('canvas.skillNoPrompt'));
         return;
     }
+    const mode = skillNode.skillMode || 'fast';
+    // 智能模式真实预览会消耗少量 LLM 额度（结果入缓存），先确认（FR2-8 两种模式都要能预览）
+    if(mode === 'llm' && !confirm(tr('canvas.skillSmartPreviewConfirm'))) return;
     try {
-        const data = await fetch('/api/skills/preview-prompt', {
+        const data = await fetch('/api/skills/compile-prompt', {
             method:'POST', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({source:skillNode.skillSource || 'custom', id:skillNode.skillId, mode:skillNode.skillMode || 'fast', prompt:promptText.slice(0, 4000)})
+            body:JSON.stringify({source:skillNode.skillSource || 'custom', id:skillNode.skillId, mode, prompt:promptText})
         }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
-        if(data.mode === 'fast'){
-            showPromptPreviewModal(`${tr('canvas.skillPreview')} · ${skillNode.skillName || skillNode.skillId}`, data.compiled_prompt);
-        } else {
-            showPromptPreviewModal(tr('canvas.skillPreview'), tr('canvas.skillSmartPreviewNote'));
-        }
+        const suffix = data.mode === 'llm' ? (data.cached ? tr('canvas.skillCacheHit') : '') : '';
+        showPromptPreviewModal(`${tr('canvas.skillPreview')} · ${skillNode.skillName || skillNode.skillId}${suffix}`, data.compiled_prompt || '');
     } catch(err) {
         showLightToast((err.message || tr('canvas.generationFailed')).slice(0, 200), 4200);
     }
@@ -13523,7 +13527,7 @@ function runTaskLabel(run){
     return run?.nodeType || 'Generate';
 }
 function requestMetaFromResult(result={}){
-    return {
+    const meta = {
         task_id: result.task_id || result.raw?.task_id || result.raw?.data?.task_id || (Array.isArray(result.raw?.data) ? result.raw.data[0]?.task_id : '') || '',
         request_id: result.request_id || result.id || result.raw?.id || '',
         provider_id: result.provider_id || result.params?.provider_id || '',
@@ -13531,13 +13535,15 @@ function requestMetaFromResult(result={}){
         prompt_id: result.prompt_id || '',
         workflow_json: result.workflow_json || '',
         seed: result.seed || '',
-        skill_used: result.skill_used || null,
-        compiled_prompt: result.compiled_prompt || '',
         image_model_requested: result.image_model_requested || '',
         image_model_observed: result.image_model_observed || '',
         image_model_confirmed: Boolean(result.image_model_confirmed),
         image_size: Array.isArray(result.image_size) ? result.image_size : null,
     };
+    // Skill 溯源只在真实使用时写入（审查 P3-1：无 skill 时不给日志加空字段）
+    if(result.skill_used) meta.skill_used = result.skill_used;
+    if(result.compiled_prompt) meta.compiled_prompt = result.compiled_prompt;
+    return meta;
 }
 function runPlatformLabel(run){
     const node = run?.node || {};
@@ -15477,6 +15483,17 @@ function canConnect(fromId, toId){
     const from = nodes.find(n => n.id === fromId);
     const to = nodes.find(n => n.id === toId);
     if(!from || !to) return false;
+    // Skill 节点只能作为输入连到生成节点，且每个生成节点至多接一个 Skill（FR2-6）
+    if(from.type === 'skill'){
+        if(!CANVAS_GENERATOR_TYPES.includes(to.type)) return false;
+        const existingSkill = connections.some(c => {
+            if(c.to !== toId || c.from === fromId) return false;
+            const upstream = nodes.find(n => n.id === c.from);
+            return upstream?.type === 'skill';
+        });
+        return !existingSkill;
+    }
+    if(to.type === 'skill') return false;
     if(CANVAS_GENERATOR_TYPES.includes(from.type)){
         if(to.type === 'output') return true;
         if(CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type) && CANVAS_GENERATOR_TYPES.includes(to.type)){

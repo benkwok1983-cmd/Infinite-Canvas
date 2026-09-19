@@ -31,7 +31,6 @@ class SkillInjectionTests(unittest.TestCase):
             p.start()
         make_skill(self.custom_dir, "style-a", "Watercolor style, soft edges.")
         make_skill(self.custom_dir, "style-b", "Cyberpunk neon, high contrast.")
-        self._patchers[0].start()
 
     def tearDown(self):
         for p in self._patchers:

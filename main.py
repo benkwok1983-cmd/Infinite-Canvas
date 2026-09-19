@@ -14262,10 +14262,11 @@ async def build_online_image_result(payload: OnlineImageRequest):
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     operation = str(payload.operation or "").strip().lower()
-    # Skill 编译注入（PRD FR2-6/FR2-7）：所有 provider 共享此入口；无 skill 时请求与原流程完全一致
+    # Skill 编译注入（PRD FR2-6/FR2-7）：所有 provider 共享此入口；无 skill 时请求与原流程完全一致。
+    # upscale（图片放大）不走提示词，跳过编译（审查 P2-5）。
     skill_used = None
     effective_prompt = payload.prompt
-    if payload.skill and str(payload.skill.id or "").strip():
+    if payload.skill and str(payload.skill.id or "").strip() and operation != "upscale":
         skill_result = await compile_skill_prompt(payload.skill, payload.prompt)
         effective_prompt = skill_result["compiled_prompt"]
         skill_used = {**skill_result["skill_used"], "cached": skill_result["cached"]}
@@ -20014,6 +20015,16 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
 
 SKILL_COMPILE_CACHE_FILE = os.path.join(DATA_DIR, "skill_compile_cache.json")
 SKILL_COMPILE_CACHE_LIMIT = 200
+SKILL_COMPILE_LOCKS = {}
+SKILL_COMPILE_LOCKS_GUARD = Lock()
+
+def skill_compile_lock(key):
+    with SKILL_COMPILE_LOCKS_GUARD:
+        lock = SKILL_COMPILE_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            SKILL_COMPILE_LOCKS[key] = lock
+        return lock
 
 def skill_compile_cache_load():
     try:
@@ -20034,11 +20045,8 @@ def skill_compile_cache_save(cache):
         pass
 
 def skill_content_snapshot(dir_path):
-    """skill 内容快照 ID：GitHub 来源用 commit_sha，其余用 SKILL.md 内容哈希（升级/编辑后自动失效缓存）。"""
-    meta = skill_read_meta(dir_path)
-    commit_sha = str(meta.get("commit_sha") or "")
-    if commit_sha:
-        return commit_sha
+    """skill 内容快照 ID：一律用 SKILL.md 内容哈希——升级/编辑后自动失效 LLM 缓存；
+    commit_sha 仅作溯源展示（审查 P1-2：编辑后 commit_sha 不变，不能作缓存键）。"""
     try:
         with open(os.path.join(dir_path, "SKILL.md"), "rb") as f:
             return "content:" + hashlib.sha256(f.read()).hexdigest()[:16]
@@ -20046,7 +20054,7 @@ def skill_content_snapshot(dir_path):
         return "content:unknown"
 
 def compose_skill_prompt_fast(body_text, user_prompt):
-    instruction = re.sub(r"\s+", " ", str(body_text or "")).strip() or "按照该 Skill 的风格要求生成图像。"
+    instruction = re.sub(r"\s+", " ", str(body_text or "")).strip()[:8000] or "按照该 Skill 的风格要求生成图像。"
     return (
         f"请严格按照以下 Skill 指令生成图像。Skill 指令：{instruction} "
         f"用户需求：{str(user_prompt or '').strip()}"
@@ -20081,33 +20089,43 @@ async def compile_skill_prompt(selection, user_prompt):
     }
     if mode == "fast":
         return {"compiled_prompt": compose_skill_prompt_fast(entry.get("body") or "", user_prompt), "skill_used": skill_used, "cached": False}
-    cache = skill_compile_cache_load()
-    key = hashlib.sha256(f"{snapshot}|{mode}|{user_prompt}".encode("utf-8")).hexdigest()
-    hit = cache.get(key)
-    if isinstance(hit, dict) and hit.get("compiled_prompt"):
-        skill_used["sha"] = hit.get("skill_sha") or snapshot
-        return {"compiled_prompt": str(hit["compiled_prompt"]), "skill_used": skill_used, "cached": True}
     provider = str(selection.provider or "").strip() or get_primary_provider_id()
-    llm_payload = CanvasLLMRequest(
-        message=f"SKILL 指令：\n{(entry.get('body') or '').strip()[:8000]}\n\n用户需求：{str(user_prompt or '').strip()}",
-        system_prompt=SKILL_LLM_SYSTEM_PROMPT,
-        provider=provider,
-        model=str(selection.model or "").strip(),
-    )
-    llm_result = await canvas_llm(llm_payload)
-    compiled = str(llm_result.get("text") or "").strip()
-    if not compiled:
-        raise HTTPException(status_code=502, detail="Skill 智能改写返回了空结果，请改用快速模式或检查 LLM 平台配置")
-    cache[key] = {"compiled_prompt": compiled, "skill_sha": snapshot, "at": now_ms()}
-    skill_compile_cache_save(cache)
-    return {"compiled_prompt": compiled, "skill_used": skill_used, "cached": False}
+    llm_model = str(selection.model or "").strip()
+    # 缓存 key 含 provider/model：切换 LLM 平台不会命中旧平台结果（审查 P2-2）
+    key = hashlib.sha256(f"{snapshot}|{mode}|{provider}|{llm_model}|{user_prompt}".encode("utf-8")).hexdigest()
+    # 同 key 并发（generator count>1）串行化：后到者直接命中先到者写入的缓存（审查 P2-3）
+    async with skill_compile_lock(key):
+        cache = skill_compile_cache_load()
+        hit = cache.get(key)
+        if isinstance(hit, dict) and hit.get("compiled_prompt"):
+            return {"compiled_prompt": str(hit["compiled_prompt"]), "skill_used": skill_used, "cached": True}
+        skill_body = (entry.get("body") or "").strip()[:8000]
+        message = f"SKILL 指令：\n{skill_body}\n\n用户需求：{str(user_prompt or '').strip()}"
+        if len(message) > LLM_MESSAGE_MAX_LENGTH:
+            raise HTTPException(status_code=400, detail=f"提示词过长（{len(message)} > {LLM_MESSAGE_MAX_LENGTH}），请缩短用户需求或 Skill 正文")
+        llm_payload = CanvasLLMRequest(
+            message=message,
+            system_prompt=SKILL_LLM_SYSTEM_PROMPT,
+            provider=provider,
+            model=llm_model,
+        )
+        llm_result = await canvas_llm(llm_payload)
+        compiled = str(llm_result.get("text") or "").strip()
+        if not compiled:
+            raise HTTPException(status_code=502, detail="Skill 智能改写返回了空结果，请改用快速模式或检查 LLM 平台配置")
+        cache = skill_compile_cache_load()
+        cache[key] = {"compiled_prompt": compiled, "skill_sha": snapshot, "at": now_ms()}
+        skill_compile_cache_save(cache)
+        return {"compiled_prompt": compiled, "skill_used": skill_used, "cached": False}
 
 def skill_diff_for_preview(selection, user_prompt):
-    """提示词预览（快速模式零成本同步返回；智能模式只返回说明，由前端触发真实编译预览接口）。"""
+    """提示词预览（快速模式零成本同步返回；智能模式由前端触发真实编译预览接口）。"""
     source = str(selection.source or "custom").strip().lower()
     if source not in ("custom", "builtin"):
         source = "custom"
     dir_path = skill_dir_for(source, str(selection.id))
+    if not os.path.isfile(os.path.join(dir_path, "SKILL.md")):
+        raise HTTPException(status_code=400, detail=f"Skill 缺少 SKILL.md，无法预览：{selection.id}")
     entry = skill_entry_from_dir(dir_path, source, include_body=True)
     mode = str(selection.mode or "fast").strip().lower()
     if mode == "fast":
@@ -20118,7 +20136,7 @@ class SkillPreviewRequest(BaseModel):
     source: str = "custom"
     id: str = Field(min_length=1, max_length=80)
     mode: str = "fast"
-    prompt: str = Field(min_length=1, max_length=4000)
+    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
 
 @app.post("/api/skills/preview-prompt")
 async def api_skill_preview_prompt(payload: SkillPreviewRequest):
