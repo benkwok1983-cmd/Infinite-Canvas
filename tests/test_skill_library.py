@@ -141,7 +141,7 @@ class SkillZipSafetyTests(unittest.TestCase):
             return real_move(src, dst, *a, **k)
         with patch.object(main.shutil, "move", failing_move):
             with self.assertRaises(OSError):
-                main.swap_staged_into_target(staged, target)
+                main.swap_staged_into_target(staged, target, meta_writer=lambda: True)
         # 旧目录自动恢复、无备份残留
         self.assertTrue((Path(target) / "SKILL.md").read_text(encoding="utf-8") == old_md)
         self.assertFalse(os.path.exists(os.path.join(self.root, ".target.install-bak")))
@@ -150,10 +150,22 @@ class SkillZipSafetyTests(unittest.TestCase):
         target = make_skill_dir(self.root, name="t2", with_md=True)
         staged = make_skill_dir(self.root, name="s2", with_md=True)
         (Path(staged) / "SKILL.md").write_text("---\nname: t2\n---\nreplaced", encoding="utf-8")
-        backup_left, replaced = main.swap_staged_into_target(staged, target)
+        backup_left, replaced = main.swap_staged_into_target(staged, target, meta_writer=lambda: True)
         self.assertTrue(replaced)
         self.assertFalse(backup_left)
         self.assertIn("replaced", (Path(target) / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_swap_rollback_on_meta_write_failure(self):
+        # 二次校审 P2 回归：元数据写入失败 → 新目录删除、旧目录恢复
+        target = make_skill_dir(self.root, name="t3", with_md=True)
+        old_md = (Path(target) / "SKILL.md").read_text(encoding="utf-8")
+        staged = make_skill_dir(self.root, name="s3", with_md=True)
+        (Path(staged) / "SKILL.md").write_text("---\nname: t3\n---\nnew", encoding="utf-8")
+        with self.assertRaises(OSError):
+            main.swap_staged_into_target(staged, target, meta_writer=lambda: False)
+        self.assertEqual((Path(target) / "SKILL.md").read_text(encoding="utf-8"), old_md)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".t3.install-bak")))
+        self.assertNotIn("new", (Path(target) / "SKILL.md").read_text(encoding="utf-8"))
 
     def test_validate_rejects_oversized_skill_md(self):
         src = make_skill_dir(self.root, name="big", with_md=True)
@@ -285,7 +297,26 @@ class SkillsApiTests(unittest.TestCase):
         self.assertEqual(gone.status_code, 404)
 
     def test_allow_api_fallback_put_get_roundtrip(self):
-        # 校审 P1-2 回归：保存开关后重新 GET 应保持 true
+        # 校审 P1-2 回归：保存开关后重新 GET 应保持 true。
+        # 二次校审 P1 修复：必须完全隔离——API_PROVIDERS_FILE 指向临时文件、
+        # update_env_values 屏蔽（PUT 会同步写 API/.env），绝不触碰用户真实配置。
+        temp_providers = os.path.join(self.tmp.name, "api_providers.json")
+        env_locker = patch.object(main, "update_env_values", lambda updates: None)
+        env_locker.start()
+        self.addCleanup(env_locker.stop)
+        rh_locker = patch.object(main, "sync_runninghub_provider_workflows_to_static_template", lambda provider: None)
+        rh_locker.start()
+        self.addCleanup(rh_locker.stop)
+        file_locker = patch.object(main, "API_PROVIDERS_FILE", temp_providers)
+        file_locker.start()
+        self.addCleanup(file_locker.stop)
+        # 播种临时配置（含 codex 平台）——默认集里没有 codex
+        seed = main.default_api_providers() + [{
+            "id": "codex", "name": "GPT CLI", "protocol": "codex",
+            "chat_models": ["gpt-5.5"], "image_models": ["gpt-image-2"],
+            "allow_api_fallback": False,
+        }]
+        Path(temp_providers).write_text(json.dumps(seed), encoding="utf-8")
         current = self.client.get("/api/providers").json()["providers"]
         payload = []
         for p in current:
@@ -301,11 +332,7 @@ class SkillsApiTests(unittest.TestCase):
         self.assertEqual(put.status_code, 200, put.text[:200])
         after = {p["id"]: p for p in self.client.get("/api/providers").json()["providers"]}
         self.assertTrue(after["codex"]["allow_api_fallback"] is True)
-        # 还原为 False，避免影响其他用例/真实配置
-        for item in payload:
-            if item.get("id") == "codex":
-                item["allow_api_fallback"] = False
-        self.client.put("/api/providers", json=payload)
+        # 临时文件随 tearDown 自动清理，真实配置从未被触碰
 
     def test_create_rejects_unusable_name(self):
         # 纯符号名规范化后为空 → 400

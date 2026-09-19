@@ -19937,9 +19937,12 @@ def locate_skill_root(extracted_root, subdir=""):
     listing = "、".join(os.path.relpath(c, extracted_root).replace("\\", "/") for c in candidates[:5])
     raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}）。请通过 subdir 参数指定目标 Skill 所在的子目录后重试。")
 
-def swap_staged_into_target(staged, target):
-    """事务性覆盖安装（校审 P1-6）：旧目录先改名为隐藏备份，staged 移入成功且元数据
-    写入后才清理备份；move 失败自动恢复旧目录。返回 (backup_left, replaced)。"""
+def swap_staged_into_target(staged, target, meta_writer=None):
+    """事务性覆盖安装（二次校审 P2：事务须覆盖元数据写入）。
+
+    流程：旧目录改名隐藏备份 → staged 移入 → meta_writer() 写元数据并验证 → 清理备份。
+    任一步失败：删除不完整新目录、恢复旧目录，异常向上抛出。
+    返回 (backup_left, replaced)。"""
     backup = os.path.join(os.path.dirname(target), "." + os.path.basename(target) + ".install-bak")
     if os.path.exists(backup):
         shutil.rmtree(backup, ignore_errors=True)
@@ -19948,14 +19951,22 @@ def swap_staged_into_target(staged, target):
         os.rename(target, backup)
     try:
         shutil.move(staged, target)
+        if meta_writer is not None and not meta_writer():
+            raise OSError("skill meta write failed")
     except Exception:
-        if replaced:
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            pass
+        if replaced and os.path.exists(backup):
             os.rename(backup, target)
         raise
+    backup_left = False
     if replaced:
         shutil.rmtree(backup, ignore_errors=True)
-        return os.path.exists(backup), True
-    return False, False
+        backup_left = os.path.exists(backup)
+    return backup_left, replaced
 
 def append_skip_warning(entry, skipped):
     """把大文件跳过信息追加为 skill 条目的 warning（预览/zip 导入路径）。"""
@@ -20028,24 +20039,21 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
             target = os.path.join(skill_source_root("custom"), skill_id)
             if os.path.exists(target) and not payload.overwrite:
                 raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
-            # 事务性覆盖（校审 P1-6/P2）：失败自动恢复旧目录
-            backup_left, replaced = swap_staged_into_target(staged, target)
-            meta_written = skill_write_meta(target, {
+            # 事务性覆盖（校审 P1-6/P2 + 二次校审）：元数据写入纳入事务，失败整体回滚
+            backup_left, replaced = swap_staged_into_target(staged, target, meta_writer=lambda: skill_write_meta(target, {
                 "source": "github",
                 "repo_url": f"https://github.com/{info['owner']}/{info['repo']}",
                 "commit_sha": info["sha"],
                 "ref": info["ref"],
                 "skill_root": skill_rel,
                 "installed_at": now_ms(),
-            })
+            }))
             result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(target, "custom")}
             warnings = []
             if skipped:
                 warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
             if replaced and backup_left:
                 warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.install-bak")
-            if not meta_written:
-                warnings.append("安装元数据写入失败，后续更新检查不可用")
             if warnings:
                 result["warnings"] = warnings
             return result
@@ -20091,14 +20099,11 @@ async def api_skill_zip_install(file: UploadFile = File(...), overwrite: bool = 
             target = os.path.join(skill_source_root("custom"), skill_id)
             if os.path.exists(target) and not overwrite:
                 raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
-            backup_left, replaced = swap_staged_into_target(staged, target)
-            meta_written = skill_write_meta(target, {"source": "zip", "installed_at": now_ms()})
+            backup_left, replaced = swap_staged_into_target(staged, target, meta_writer=lambda: skill_write_meta(target, {"source": "zip", "installed_at": now_ms()}))
             result = {"ok": True, "id": skill_id, "skill": skill_entry_from_dir(target, "custom")}
             warnings = []
             if replaced and backup_left:
                 warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.install-bak")
-            if not meta_written:
-                warnings.append("安装元数据写入失败，不影响使用")
             if warnings:
                 result["warnings"] = warnings
             return result
@@ -20154,28 +20159,35 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
                 raise HTTPException(status_code=500, detail=f"升级失败：旧目录无法重命名（可能被其他程序占用）：{exc}") from exc
             try:
                 shutil.move(staged, dir_path)
+                # 元数据写入纳入事务：失败则回滚到旧版本（二次校审 P2）
+                meta_written = skill_write_meta(dir_path, {
+                    **meta,
+                    "commit_sha": info["sha"],
+                    "ref": info["ref"],
+                    "skill_root": skill_rel,
+                    "updated_at": now_ms(),
+                })
+                if not meta_written:
+                    raise OSError("upgrade meta write failed")
             except Exception:
-                os.rename(backup, dir_path)
+                try:
+                    if os.path.isdir(dir_path):
+                        shutil.rmtree(dir_path, ignore_errors=True)
+                except OSError:
+                    pass
+                if os.path.exists(backup):
+                    os.rename(backup, dir_path)
                 raise
             backup_left = os.path.exists(backup)
             if backup_left:
                 shutil.rmtree(backup, ignore_errors=True)
                 backup_left = os.path.exists(backup)
-            meta_written = skill_write_meta(dir_path, {
-                **meta,
-                "commit_sha": info["sha"],
-                "ref": info["ref"],
-                "skill_root": skill_rel,
-                "updated_at": now_ms(),
-            })
             result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(dir_path, "custom")}
             warnings = []
             if skipped:
                 warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
             if backup_left:
                 warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.upgrade-bak")
-            if not meta_written:
-                warnings.append("升级元数据写入失败，后续更新检查不可用")
             if warnings:
                 result["warnings"] = warnings
             return result
@@ -20209,17 +20221,38 @@ def skill_compile_cache_load():
         return {}
 
 def skill_compile_cache_save(cache):
-    """临时文件 + 原子替换：并发/异常不会留下半截 JSON（校审 P2：缓存文件损坏防护）。"""
+    """唯一临时文件 + flush/fsync + 原子替换（二次校审 P2）。
+    调用方必须持有 _SKILL_CACHE_FILE_LOCK，避免跨 key 并发互相覆盖。"""
+    tmp_path = ""
     try:
         if len(cache) > SKILL_COMPILE_CACHE_LIMIT:
             trimmed = sorted(cache.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:SKILL_COMPILE_CACHE_LIMIT]
             cache = dict(trimmed)
-        tmp_path = SKILL_COMPILE_CACHE_FILE + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        cache_dir = os.path.dirname(SKILL_COMPILE_CACHE_FILE) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix="skill_cache_", suffix=".tmp", dir=cache_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, SKILL_COMPILE_CACHE_FILE)
+        tmp_path = ""
     except Exception:
         pass
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+_SKILL_CACHE_FILE_LOCK = asyncio.Lock()
+
+async def skill_compile_cache_merge(key, record):
+    """全局文件锁内完成 读取→合并→原子写：跨 key 并发不会互相覆盖（二次校审 P2）。"""
+    async with _SKILL_CACHE_FILE_LOCK:
+        cache = skill_compile_cache_load()
+        cache[key] = record
+        skill_compile_cache_save(cache)
 
 def skill_content_snapshot(dir_path):
     """skill 内容快照 ID：一律用 SKILL.md 内容哈希——升级/编辑后自动失效 LLM 缓存；
@@ -20314,9 +20347,7 @@ async def compile_skill_prompt(selection, user_prompt):
         compiled = str(llm_result.get("text") or "").strip()
         if not compiled:
             raise HTTPException(status_code=502, detail="Skill 智能改写返回了空结果，请改用快速模式或检查 LLM 平台配置")
-        cache = skill_compile_cache_load()
-        cache[key] = {"compiled_prompt": compiled, "skill_sha": snapshot, "at": now_ms()}
-        skill_compile_cache_save(cache)
+        await skill_compile_cache_merge(key, {"compiled_prompt": compiled, "skill_sha": snapshot, "at": now_ms()})
         return {"compiled_prompt": compiled, "skill_used": skill_used, "cached": False}
 
 def skill_diff_for_preview(selection, user_prompt):
@@ -20338,11 +20369,13 @@ class SkillPreviewRequest(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     mode: str = "fast"
     variant: str = ""
+    model: str = ""
+    provider: str = ""
     prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
 
 @app.post("/api/skills/preview-prompt")
 async def api_skill_preview_prompt(payload: SkillPreviewRequest):
-    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant)
+    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant, model=payload.model or "", provider=payload.provider or "")
     return skill_diff_for_preview(selection, payload.prompt)
 
 SKILL_VARIANT_SUGGEST_SYSTEM = (
@@ -20399,7 +20432,7 @@ async def api_skill_suggest_variants(skill_id: str, payload: SkillVariantSuggest
 @app.post("/api/skills/compile-prompt")
 async def api_skill_compile_prompt(payload: SkillPreviewRequest):
     """智能模式的真实编译预览（走 LLM，结果进缓存；调用会消耗 LLM 额度）。"""
-    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant)
+    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant, model=payload.model or "", provider=payload.provider or "")
     result = await compile_skill_prompt(selection, payload.prompt)
     return result
 

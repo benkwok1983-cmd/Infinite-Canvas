@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyyaml
+      - name: Run test suites
+        run: |
+          python tests/test_skill_injection.py
+          python tests/test_skill_library.py
+          python tests/test_gpt_image_2_skill_args.py
+      - name: Sensitive info guard
+        shell: bash
+        run: |
+          # 校审要求：日志与代码中不得出现完整 API Key / 带密钥命令行
+          if grep -n "FULL_ARGV\|--api-key.*\$\|print(f\".*api_key" main.py; then
+            echo "::error::敏感信息输出模式命中，请人工复核"
+            exit 1
+          fi
+          echo "sensitive-info guard passed"
