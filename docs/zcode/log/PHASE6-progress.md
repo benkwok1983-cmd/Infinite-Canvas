@@ -18,3 +18,18 @@
 
 - 提交 20+ 个，全部推送 fork `zcode/iteration-01`；全量 47 项单测；3 轮子代理审查（Phase 2/3/5，共修复 P0×3、P1×7、P2×15+）。
 - 交付：PRD/WORKPLAN/日志/handoff 全套迭代文档；Codex 订阅实验性 2.5（request create 注入 + 诚实反馈 + UI 开关 API 回退）；Skill 库后端 + 管理页 + 画布 Skill 节点（双模式编译注入 + 缓存 + 溯源）。
+
+## 补记（2026-09-19 晚）：T6.1-b fast 模式端到端验收 ✅ 初步通过
+
+用户授权下在真实画布（文生图与参考图测试）完成全链路验收：
+
+- **链路**：Skill 节点（mono-color·快速）+ 现有提示词节点 + 现有参考图 → 新建 ModelScope 生成节点（Klein 图生图）→ 真实生成
+- **fetch 拦截铁证**：compile-prompt 收到 88 字符原始提示词 → /api/ms/generate 发出 3825 字符编译提示词
+- **出图验证**：输出图完整呈现 mono-color 风格（暖纸底、单墨半调网点、杂志编辑排版、主动负空间），参考图的写实照片被风格重铸
+- **溯源**：生成日志含 request.skill_used = {id: mono-color, mode: fast, sha: content:8274bc1f}，prompt 即编译后最终提示词
+- **过程中发现并修复 2 个真实问题**：
+  1. 右键创建菜单（canvas.html 硬编码）缺 Skill 项（用户实测发现）→ 已补
+  2. fast 拼接 8049 字符超 ModelScope 上游 prompt≤4000 限制被拒 → SKILL_FAST_PROMPT_MAX=3800 总长控制，截断修复后重生成成功
+- 另修复：子页面 HTML 走 StaticFiles 被浏览器启发式缓存 → /static/{page} 路由 no-cache（需注册在 mount 前）
+- 节点与生成结果保留在用户画布；algorithmic-art 与 mono-color 两个 skill 留在库中
+- T1.2 探测与 llm 模式/ Codex 订阅 smoke 仍待用户额度（PHASE6-pending-verification.md）
