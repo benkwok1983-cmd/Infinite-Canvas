@@ -8364,19 +8364,29 @@ function llmInputVideos(node){
 }
 // ===== 生图 Skill 节点（PRD FR2-5~FR2-9）=====
 // Skill 是指令文档包：节点只选择与连线，编译在生成时进行（fast=后端拼接 / llm=LLM 改写+缓存）。
-let skillLibraryCache = {list: [], loaded: false};
+let skillLibraryCache = {list: [], loaded: false, fetchedAt: 0, fetching: false};
+const SKILL_LIBRARY_TTL = 60 * 1000;
 async function loadSkillLibrary(force=false){
-    if(skillLibraryCache.loaded && !force) return skillLibraryCache.list;
+    if(skillLibraryCache.fetching) return skillLibraryCache.list;
+    if(skillLibraryCache.loaded && !force && Date.now() - skillLibraryCache.fetchedAt < SKILL_LIBRARY_TTL) return skillLibraryCache.list;
+    skillLibraryCache.fetching = true;
     try {
         const data = await fetch('/api/skills').then(r => r.ok ? r.json() : {skills:[]});
         skillLibraryCache.list = (data.skills || []).filter(s => s.has_skill_md && ['custom','builtin'].includes(s.source));
         skillLibraryCache.loaded = true;
-        // 库异步就绪后重渲染，已选 skill 的下拉才能正确回显（审查 P2-6）
+        skillLibraryCache.fetchedAt = Date.now();
+        // 库异步就绪后重渲染：已选 skill 的下拉/样板菜单正确回显（含管理页改动后自动跟进）
         if(typeof nodes !== 'undefined' && nodes.some(n => n.type === 'skill')) render();
     } catch(e) {
-        skillLibraryCache.list = [];
+        skillLibraryCache.list = skillLibraryCache.loaded ? skillLibraryCache.list : [];
+    } finally {
+        skillLibraryCache.fetching = false;
     }
     return skillLibraryCache.list;
+}
+function ensureSkillLibraryFresh(){
+    // 画布与管理页是两个页面：管理页改动样板后，画布靠 TTL 过期自动拉新
+    if(Date.now() - (skillLibraryCache.fetchedAt || 0) > SKILL_LIBRARY_TTL) loadSkillLibrary(true);
 }
 function connectedSkillSource(gen){
     return connections.filter(c => c.to === gen.id)
@@ -8409,6 +8419,7 @@ function skillVariantOptionsHtml(node){
     </select>`;
 }
 function renderSkillBody(node){
+    ensureSkillLibraryFresh();
     const wrap = document.createElement('div');
     wrap.className = 'skill-node-body';
     wrap.innerHTML = `
