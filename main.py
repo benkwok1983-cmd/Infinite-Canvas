@@ -19342,7 +19342,7 @@ SKILLS_MAX_FILE_BYTES = 20 * 1024 * 1024
 SKILLS_MAX_TOTAL_BYTES = 50 * 1024 * 1024
 SKILLS_MAX_FILES = 500
 SKILLS_ZIP_MAX_BYTES = 20 * 1024 * 1024
-SKILLS_ZIP_STREAM_MAX_BYTES = 60 * 1024 * 1024
+SKILLS_ZIP_STREAM_MAX_BYTES = 120 * 1024 * 1024
 # 导入时跳过的大文件阈值：示例图/大素材对提示词编译无影响（编译只读 SKILL.md 文本），
 # 跳过它们才能导入含大量示例图的超大 skill 仓库（如 mono-color-skill 72MB）。
 SKILLS_SKIP_FILE_BYTES = 2 * 1024 * 1024
@@ -19905,12 +19905,14 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
             os.makedirs(extracted)
             extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
             skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
-            if not skill_id:
-                skill_id = normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
-            if not SKILL_ID_RE.match(skill_id):
-                raise HTTPException(status_code=400, detail=f"从 SKILL.md/仓库名推导的 ID 不合法：{skill_id[:60]}，请手动指定名称")
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
+            append_skip_warning(entry, skipped)
+            if not skill_id:
+                # 优先 SKILL.md frontmatter name；zipball 顶层目录名（owner-repo-sha）只是兜底
+                skill_id = normalize_skill_id(str(entry.get("name") or "")) or normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
+            if not SKILL_ID_RE.match(skill_id):
+                raise HTTPException(status_code=400, detail=f"从 SKILL.md/仓库名推导的 ID 不合法：{skill_id[:60]}，请手动指定名称")
             target = os.path.join(skill_source_root("custom"), skill_id)
             if os.path.exists(target):
                 if not payload.overwrite:
