@@ -3139,12 +3139,18 @@ async function runMsGenNode(nodeId, opts={}){
     // 转圈卡片必须先于 Skill 编译创建：智能模式的 LLM 编译可能耗时 10-60s，
     // 否则点击生成后长时间无任何反馈（用户实测反馈）。
     if(out) out._pending = [...(out._pending || []), ...pendingIds.map(id => makePendingForRun(id, run, node, {refs, requestSize, cascadeTargetId}))];
-    if(!opts.cascade){
+    const reEnableAfter = (delay) => { if(!opts.cascade) setTimeout(() => { node.running = false; refreshRunNodes(node, out); }, delay); };
+    if(!skillSource){
+        // 无 skill：保持原时序（2s 后解锁按钮，任务由 pending 卡片追踪）
         node.running = true;
         refreshRunNodes(node, out);
-        setTimeout(() => { node.running = false; refreshRunNodes(node, out); }, 2000);
+        reEnableAfter(2000);
+    } else {
+        // 有 skill：编译期间保持锁定 + 显示「AI 编译中」，防重复点击重复生图
+        node.running = true;
+        node.runStatus = 'compiling';
+        refreshRunNodes(node, out);
     }
-    else refreshRunNodes(node, out);
     // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）。
     // 提示词可选：有参考图 + skill 即可生图（编译产物=skill 指令与所选样板）
     let skillUsed = null;
@@ -3157,10 +3163,14 @@ async function runMsGenNode(nodeId, opts={}){
             prompt = compiled.compiled_prompt;
             skillUsed = {...compiled.skill_used, cached:compiled.cached};
             run.prompt = prompt;
+            node.runStatus = '';
+            reEnableAfter(2000);
         } catch(err) {
             // 编译失败：回收刚创建的转圈卡片并落日志，保持与生成失败同样的反馈
             if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
             node.running = false;
+            node.runStatus = 'failed';
+            node.runError = err.message || String(err);
             refreshRunNodes(node, out);
             addGenerationLog({run, outputs:[], runMs:0, error:err.message || String(err)});
             alert((err.message || tr('canvas.generationFailed')).slice(0, 220));
@@ -6228,7 +6238,7 @@ function renderNode(node){
     const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'].includes(node.type) && node.runStatus
         && (node.runStatus !== 'failed' || node._cascadeFailed);
     const statusHtml = showStatus ? (() => {
-        const label = { queued:'排队中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
+        const label = { queued:'排队中', compiling:'AI 编译中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
         return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${node._cascadeIdx?' '+node._cascadeIdx:''}</span>`;
     })() : '';
     el.innerHTML = `<div class="node-head"><span class="node-title">${displayTitle}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}<button onclick="deleteNodeFromButton('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
