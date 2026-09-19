@@ -19342,6 +19342,10 @@ SKILLS_MAX_FILE_BYTES = 20 * 1024 * 1024
 SKILLS_MAX_TOTAL_BYTES = 50 * 1024 * 1024
 SKILLS_MAX_FILES = 500
 SKILLS_ZIP_MAX_BYTES = 20 * 1024 * 1024
+SKILLS_ZIP_STREAM_MAX_BYTES = 60 * 1024 * 1024
+# 导入时跳过的大文件阈值：示例图/大素材对提示词编译无影响（编译只读 SKILL.md 文本），
+# 跳过它们才能导入含大量示例图的超大 skill 仓库（如 mono-color-skill 72MB）。
+SKILLS_SKIP_FILE_BYTES = 2 * 1024 * 1024
 SKILLS_SCRIPT_EXTS = {".py", ".sh", ".js", ".mjs", ".cjs", ".cmd", ".bat", ".ps1", ".exe", ".dll"}
 
 try:
@@ -19724,7 +19728,7 @@ async def github_download_repo_zip(url, sha_or_ref=""):
                         fd = None
                         async for chunk in zip_resp.aiter_bytes(1 << 16):
                             downloaded += len(chunk)
-                            if downloaded > SKILLS_ZIP_MAX_BYTES:
+                            if downloaded > SKILLS_ZIP_STREAM_MAX_BYTES:
                                 over_limit = True
                                 break
                             f.write(chunk)
@@ -19735,7 +19739,7 @@ async def github_download_repo_zip(url, sha_or_ref=""):
             except httpx.HTTPError as exc:
                 raise HTTPException(status_code=502, detail=f"GitHub 网络请求失败：{exc}") from exc
         if over_limit:
-            raise HTTPException(status_code=400, detail=f"仓库压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
+            raise HTTPException(status_code=400, detail=f"仓库压缩包超过 {SKILLS_ZIP_STREAM_MAX_BYTES // (1024*1024)}MB 上限")
     finally:
         if fd is not None:
             try:
@@ -19750,38 +19754,71 @@ async def github_download_repo_zip(url, sha_or_ref=""):
     return temp_zip, info
 
 def safe_extract_skill_zip(zip_path, dest_root):
-    """解压 zip 到 dest_root，带 zip-slip/大小/数量防护。返回解压根目录（zip 内唯一顶层目录）。"""
+    """解压 zip 到 dest_root，带 zip-slip/大小/数量防护与大文件跳过。
+
+    返回 (解压根目录, skipped)；超过 SKILLS_SKIP_FILE_BYTES 的非 SKILL.md 文件跳过不写盘
+    （示例图/大素材对提示词编译无影响——编译只读 SKILL.md 文本），skipped 由调用方汇总进 warnings。
+    """
     total_bytes = 0
     file_count = 0
+    skipped = []
+    skipped_bytes = 0
     try:
         with zipfile.ZipFile(zip_path) as archive:
             names = archive.namelist()
             if not names:
                 raise HTTPException(status_code=400, detail="压缩包为空")
             top_prefix = names[0].split("/")[0] + "/"
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
+
+            def rel_path_of(info):
                 rel = info.filename
                 if rel.startswith(top_prefix):
                     rel = rel[len(top_prefix):]
+                return rel
+
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                rel = rel_path_of(info)
                 if not rel or rel.startswith("/") or ".." in rel.replace("\\", "/").split("/") or ":" in rel:
                     raise HTTPException(status_code=400, detail=f"压缩包含非法路径：{info.filename[:80]}")
                 file_count += 1
-                total_bytes += info.file_size
                 if info.file_size > SKILLS_MAX_FILE_BYTES:
                     raise HTTPException(status_code=400, detail=f"压缩包内单文件超过 {SKILLS_MAX_FILE_BYTES // (1024*1024)}MB 上限：{info.filename[:80]}")
                 if file_count > SKILLS_MAX_FILES:
                     raise HTTPException(status_code=400, detail=f"文件数超过 {SKILLS_MAX_FILES} 上限")
-                if total_bytes > SKILLS_MAX_TOTAL_BYTES:
-                    raise HTTPException(status_code=400, detail=f"解压后超过 {SKILLS_MAX_TOTAL_BYTES // (1024*1024)}MB 上限")
-            archive.extractall(dest_root)
+                if info.file_size > SKILLS_SKIP_FILE_BYTES and not rel.upper().endswith("SKILL.MD"):
+                    skipped.append((rel, info.file_size))
+                    skipped_bytes += info.file_size
+                else:
+                    total_bytes += info.file_size
+                    if total_bytes > SKILLS_MAX_TOTAL_BYTES:
+                        raise HTTPException(status_code=400, detail=f"解压后超过 {SKILLS_MAX_TOTAL_BYTES // (1024*1024)}MB 上限")
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                rel = rel_path_of(info)
+                if info.file_size > SKILLS_SKIP_FILE_BYTES and not rel.upper().endswith("SKILL.MD"):
+                    continue
+                archive.extract(info, dest_root)
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=400, detail="压缩包格式无效") from exc
     entries = [name for name in os.listdir(dest_root) if not name.startswith(".")]
     if len(entries) != 1 or not os.path.isdir(os.path.join(dest_root, entries[0])):
         raise HTTPException(status_code=400, detail="压缩包结构异常（应只有一个顶层目录）")
-    return os.path.join(dest_root, entries[0])
+    root = os.path.join(dest_root, entries[0])
+    skipped_info = None
+    if skipped:
+        skipped.sort(key=lambda item: -item[1])
+        summary = "、".join(f"{os.path.basename(name)}({size // 1024}KB)" for name, size in skipped[:4])
+        more = f" 等{len(skipped)}个" if len(skipped) > 4 else ""
+        skipped_info = {"count": len(skipped), "total_bytes": skipped_bytes, "summary": summary + more}
+        try:
+            with open(os.path.join(root, ".skipped-large-files.json"), "w", encoding="utf-8") as f:
+                json.dump({"skipped": skipped, "total_bytes": skipped_bytes}, f, ensure_ascii=False)
+        except OSError:
+            pass
+    return root, skipped_info
 
 def locate_skill_root(extracted_root, subdir=""):
     """定位 SKILL.md：优先仓库根；可显式指定子目录（monorepo 多 skill）；否则要求恰好一个含 SKILL.md 的子目录。"""
@@ -19811,6 +19848,13 @@ def locate_skill_root(extracted_root, subdir=""):
     listing = "、".join(os.path.relpath(c, extracted_root).replace("\\", "/") for c in candidates[:5])
     raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}）。请通过 subdir 参数指定目标 Skill 所在的子目录后重试。")
 
+def append_skip_warning(entry, skipped):
+    """把大文件跳过信息追加为 skill 条目的 warning（预览/zip 导入路径）。"""
+    if skipped and isinstance(entry, dict):
+        entry.setdefault("warnings", []).append(
+            f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译"
+        )
+
 def validate_and_stage_skill(skill_root, staged_root):
     """校验 skill_root 并复制到 staged_root（临时暂存），返回 (entry, warnings)。"""
     shutil.copytree(skill_root, staged_root, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git*", "__pycache__*"))
@@ -19826,10 +19870,11 @@ async def api_skill_github_preview(payload: SkillGithubPreviewRequest):
         with tempfile.TemporaryDirectory(prefix="skill_preview_") as temp_dir:
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
-            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
             skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
+            append_skip_warning(entry, skipped)
             entry["id"] = (
                 normalize_skill_id(str(entry.get("name") or ""))
                 or normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
@@ -19858,7 +19903,7 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
         with tempfile.TemporaryDirectory(prefix="skill_install_") as temp_dir:
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
-            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
             skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
             if not skill_id:
                 skill_id = normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
@@ -19872,7 +19917,7 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
                     raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
                 shutil.rmtree(target)
             shutil.move(staged, target)
-            skill_write_meta(target, {
+            meta_written = skill_write_meta(target, {
                 "source": "github",
                 "repo_url": f"https://github.com/{info['owner']}/{info['repo']}",
                 "commit_sha": info["sha"],
@@ -19880,7 +19925,15 @@ async def api_skill_github_install(payload: SkillGithubInstallRequest):
                 "skill_root": skill_rel,
                 "installed_at": now_ms(),
             })
-            return {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(target, "custom")}
+            result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(target, "custom")}
+            warnings = []
+            if skipped:
+                warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
+            if not meta_written:
+                warnings.append("安装元数据写入失败，后续更新检查不可用")
+            if warnings:
+                result["warnings"] = warnings
+            return result
     finally:
         try:
             os.remove(temp_zip)
@@ -19898,7 +19951,7 @@ async def api_skill_zip_install(file: UploadFile = File(...), overwrite: bool = 
             if not chunk:
                 break
             total_uploaded += len(chunk)
-            if total_uploaded > SKILLS_ZIP_MAX_BYTES:
+            if total_uploaded > SKILLS_ZIP_STREAM_MAX_BYTES:
                 over_limit = True
                 break
             f.write(chunk)
@@ -19907,15 +19960,16 @@ async def api_skill_zip_install(file: UploadFile = File(...), overwrite: bool = 
             os.remove(temp_zip)
         except OSError:
             pass
-        raise HTTPException(status_code=400, detail=f"压缩包超过 {SKILLS_ZIP_MAX_BYTES // (1024*1024)}MB 上限")
+        raise HTTPException(status_code=400, detail=f"压缩包超过 {SKILLS_ZIP_STREAM_MAX_BYTES // (1024*1024)}MB 上限")
     try:
         with tempfile.TemporaryDirectory(prefix="skill_zip_install_") as temp_dir:
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
-            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
             skill_root, _rel = locate_skill_root(extracted_root)
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
+            append_skip_warning(entry, skipped)
             skill_id = normalize_skill_id(entry.get("name") or os.path.basename(skill_root.rstrip("/\\")))
             if not SKILL_ID_RE.match(skill_id):
                 raise HTTPException(status_code=400, detail=f"从 SKILL.md 推导的 ID 不合法：{skill_id[:60]}")
@@ -19967,7 +20021,7 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
         with tempfile.TemporaryDirectory(prefix="skill_upgrade_") as temp_dir:
             extracted = os.path.join(temp_dir, "x")
             os.makedirs(extracted)
-            extracted_root = safe_extract_skill_zip(temp_zip, extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
             skill_root, skill_rel = locate_skill_root(extracted_root, str(meta.get("skill_root") or ""))
             staged = os.path.join(temp_dir, "staged")
             entry = validate_and_stage_skill(skill_root, staged)
@@ -19998,6 +20052,8 @@ async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
             })
             result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(dir_path, "custom")}
             warnings = []
+            if skipped:
+                warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
             if backup_left:
                 warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.upgrade-bak")
             if not meta_written:

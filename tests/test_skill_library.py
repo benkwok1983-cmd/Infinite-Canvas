@@ -125,8 +125,26 @@ class SkillZipSafetyTests(unittest.TestCase):
         ])
         dest = os.path.join(self.root, "out")
         os.makedirs(dest)
-        root = main.safe_extract_skill_zip(zip_path, dest)
+        root, skipped = main.safe_extract_skill_zip(zip_path, dest)
+        self.assertIsNone(skipped)
         self.assertTrue(os.path.isfile(os.path.join(root, "SKILL.md")))
+
+    def test_safe_extract_skips_large_files_but_keeps_skill_md(self):
+        big = "x" * (main.SKILLS_SKIP_FILE_BYTES + 1024)
+        zip_path = self._zip([
+            ("packaged/SKILL.md", "---\nname: demo\n---\nBody"),
+            ("packaged/examples/big.png", big),
+            ("packaged/references/g.md", "guide"),
+        ])
+        dest = os.path.join(self.root, "outskip")
+        os.makedirs(dest)
+        root, skipped = main.safe_extract_skill_zip(zip_path, dest)
+        self.assertIsNotNone(skipped)
+        self.assertEqual(skipped["count"], 1)
+        self.assertTrue(os.path.isfile(os.path.join(root, "SKILL.md")))
+        self.assertTrue(os.path.isfile(os.path.join(root, "references", "g.md")))
+        self.assertFalse(os.path.exists(os.path.join(root, "examples", "big.png")))
+        self.assertTrue(os.path.isfile(os.path.join(root, ".skipped-large-files.json")))
 
     def test_zip_slip_entry_rejected(self):
         zip_path = self._zip([
