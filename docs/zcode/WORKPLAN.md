@@ -60,11 +60,11 @@
 
 | 任务 | 内容 | 状态 |
 |---|---|---|
-| T5.1 | smart-canvas 新节点类型「生图 Skill」：渲染、skill 下拉（分组）、版本/来源显示、参数区、连线规则（至多 1 个/生成节点）；画布数据结构向后兼容（旧画布文件不受影响） | 待办 |
-| T5.2 | 生成链路注入：前端 `runApiGeneration`（smart-canvas.js:16266）payload 带 skill 字段 → 后端 `run_canvas_image_task`（main.py:14548）统一编译注入（覆盖 API/ModelScope 等 provider）；快速/智能双模式 ＋ 智能模式缓存 | 待办 |
-| T5.3 | 提示词预览 UI ＋ 结果溯源展示（结果节点信息面板显示 skill 版本/最终提示词/模型） | 待办 |
-| T5.4 | 回归：不连 skill 节点请求逐字段一致；AC2-1～AC2-7 全过（智能模式 LLM 消耗部分若需真实调用，先获授权） | 待办 |
-| T5.5 | 审查 ＋ 浏览器实测 ＋ 日志/handoff ＋ 提交推送 | 待办 |
+| T5.1 | 普通画布 canvas.js 新节点类型「生图 Skill」（范围修订见 PRD FR2-5）：渲染/下拉/模式切换/连线闸门（canConnect/canOutput/createNodeByType）/至多 1 个；数据向后兼容 | ✅ 2026-09-19 |
+| T5.2 | 生成链路注入：generator 走 payload.skill 后端统一编译注入（build_online_image_result，覆盖全部 provider）；msgen 专用端点走前端预编译；快速/智能双模式 ＋ asyncio.Lock 缓存串行化 | ✅ 2026-09-19 |
+| T5.3 | 提示词预览（generator 节点预览按钮：fast 即时弹层/llm confirm 后真实编译）＋ 溯源（requestMeta 条件写 skill_used/compiled_prompt） | ✅ 2026-09-19 |
+| T5.4 | 单测 6 项（AC2-1/2/7 + 注入溯源/缓存失效）＋ 真实闸门 E2E 全过；AC2-4/6 由 Phase3 测试与真实导入覆盖；llm 真实改写端到端待额度授权 | ✅ 2026-09-19 |
+| T5.5 | 子代理审查（P0×2/P1×3/P2×6/P3×4 全修复，含连线闸门死代码等关键捕获）＋ 浏览器实测（真实闸门路径）＋ 日志/handoff/推送 | ✅ 2026-09-19 |
 
 ## Phase 6：收尾
 
