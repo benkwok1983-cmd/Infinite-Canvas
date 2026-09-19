@@ -34,6 +34,36 @@ https://www.fhl.mom/register?aff=86L574B4T2N9  （包含codex和GPT image 2模�
 
 --------
 
+## 本 fork 新增功能（zcode/iteration-01 分支）
+
+### 1. Codex 订阅额度生图 · 实验性 Image 2.5
+
+在 API 设置中添加「GPT CLI」（Codex）平台并完成本机 `codex` 登录后，画布生图走 ChatGPT 订阅额度（不消耗 API 费用）。
+
+- 生图模型下拉提供三档：**gpt-image-2**（默认，稳定）、**gpt-image-2.5-flare / sunburst**（实验性）
+- 实验档通过底层请求注入图像模型名；服务端可能忽略该选择并返回别名，界面上会如实提示「2.5 选择未被服务端确认」
+- 结果元数据记录：请求模型 / 服务端实际观察模型 / 实际尺寸，不做任何虚标
+- API 设置的 Codex 卡片内有「API 回退」开关（默认关）：开启后 Codex 登录过期时自动改用 OpenAI API Key 生图（按 API 计费）；关闭时直接报错提示重新登录
+- 实验性 2.5 档仅支持文生图，且**只走订阅额度，永不回退 API**
+
+### 2. 画布生图 Skill 节点 + Skill 库
+
+把 GitHub 开源 Skill 或自建风格包导入画布，生成时按 Skill 编译提示词，产出指定风格图像。
+
+- **Skill 库管理**（左侧导航「Skill 库」）：GitHub 导入（预览确认 → 固定 commit SHA → 一键升级）、zip 导入、自建编辑；第三方 Skill 的脚本永不执行
+- **生图 Skill 节点**（普通画布）：从「API 生成 / MS 生成」节点的输入端口创建 Skill 节点，下拉选 Skill、选模式、连线即可
+  - **快速模式**：Skill 指令与提示词直接拼接，零额外消耗
+  - **智能模式**：生成时由 LLM 按 Skill 融合改写提示词（结果缓存复用，消耗少量 LLM 额度）
+- 生成节点上的「预览提示词」可查看编译后的最终提示词；每张结果图记录所用 Skill、版本与最终提示词（可溯源）
+
+### 开发说明（本 fork）
+
+- 迭代文档：`docs/zcode/PRD.md`（需求）、`WORKPLAN.md`（进度）、`log/`（各阶段日志）、`handoff/`（交接）
+- 单元测试：`.\python\python.exe tests\test_skill_library.py`、`tests\test_skill_injection.py`、`tests\test_gpt_image_2_skill_args.py`（共 47 项，零额度消耗）
+- Codex 2.5 探测脚本（额度重置后验证服务端是否真正支持 2.5）：`tools/zcode-verify/codex_image25_probe.py`（默认 dry-run 零消耗，`--run` 才真实调用）
+
+--------
+
 已经申请著作权，禁止商业用途
 
 Commercial use is prohibited.
