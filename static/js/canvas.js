@@ -2787,6 +2787,7 @@ function renderMsGenBody(node){
             ).join('')}
         </div>
         <div class="ms-content">
+            ${renderSkillLine(node)}
             <div class="prompt-list mt-2 mb-2"></div>
             ${msUsesImages ? `
             <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">${tr('canvas.images')}</div>
@@ -3097,6 +3098,13 @@ function renderMsGenBody(node){
     }
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    const msSkillPreviewBtn = wrap.querySelector('.skill-preview-btn');
+    if(msSkillPreviewBtn){
+        msSkillPreviewBtn.onclick = e => {
+            e.stopPropagation();
+            previewCompiledPrompt(node, ordered.map(s => s.prompt).filter(Boolean).join('\n\n'));
+        };
+    }
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
