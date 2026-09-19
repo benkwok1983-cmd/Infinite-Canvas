@@ -2585,6 +2585,10 @@ function addLLMNode(point){
         running:false
     });
 }
+function addSkillNode(point){
+    const p = point || defaultPoint(120, 0);
+    return addNode({id:uid('skill'), type:'skill', x:p.x, y:p.y, skillSource:'custom', skillId:'', skillName:'', skillVersion:'', skillMode:'fast', inputs:[]});
+}
 function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
     const providerId = imageApiProviders()[0]?.id || '';
@@ -3101,7 +3105,8 @@ async function runMsGenNode(nodeId, opts={}){
     if(!node || (node.running && !opts.cascade)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
-    const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
+    const skillSource = sources.find(s => s.type === 'skill' && s.skill?.id);
+    let prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     const modelKey = node.msgenModel || 'zimage';
     const msModel = MS_GEN_MODELS[modelKey] || MS_GEN_MODELS.zimage;
@@ -3109,6 +3114,21 @@ async function runMsGenNode(nodeId, opts={}){
     const msLoras = modelscopeLorasForModel(msModelId);
     if(!prompt){ alert(tr('canvas.needPrompt')); return; }
     if(msModel.supportsImage && !refs.length){ alert(tr('canvas.needImage')); return; }
+    // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）
+    let skillUsed = null;
+    if(skillSource){
+        try {
+            const compiled = await fetch('/api/skills/compile-prompt', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, prompt:prompt.slice(0, 4000)})
+            }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
+            prompt = compiled.compiled_prompt;
+            skillUsed = {...compiled.skill_used, cached:compiled.cached};
+        } catch(err) {
+            alert((err.message || tr('canvas.generationFailed')).slice(0, 220));
+            return;
+        }
+    }
     const count = Math.max(1, Math.min(8, Number(node.count || 1)));
     // 链路中间节点默认不创建 Output；链尾、手动开启或已有 Output 连接时才输出。
     let out = outputForNode(node, 460);
@@ -3176,6 +3196,7 @@ async function runMsGenNode(nodeId, opts={}){
         const metas = collectRunMetas(out, pendingIds);
         const outputUrls = results.map(data => data.url).filter(Boolean);
         run.request = results[0] ? requestMetaFromResult(results[0]) : {};
+        if(skillUsed) run.request.skill_used = skillUsed;
         if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
         appendOutputImages(out, outputUrls, refs[0], metas);
         mergeGeneratedOutputs(node, outputUrls, Boolean(opts.cascade));
@@ -3250,6 +3271,12 @@ function linkCreateOptions(state){
     const node = nodes.find(n => n.id === state?.originId);
     if(!node) return [];
     if(state.originKind === 'out'){
+        if(node.type === 'skill'){
+            return [
+                {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
+                {type:'msgen', label:tr('canvas.modelscopeGenerate'), icon:'cloud-lightning'}
+            ];
+        }
         if(['image','prompt','loop','group','promptGroup','llm','output'].includes(node.type)){
             return [
                 {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
@@ -3269,6 +3296,7 @@ function linkCreateOptions(state){
         return [
             {type:'image', label:tr('canvas.imageCard'), icon:'image-plus'},
             {type:'prompt', label:tr('canvas.prompt'), icon:'text-cursor-input'},
+            {type:'skill', label:tr('canvas.skillNode'), icon:'sparkles'},
             {type:'loop', label:tr('canvas.loopNode'), icon:'repeat-2'},
             {type:'group', label:tr('canvas.group'), icon:'group'},
             {type:'llm', label:'LLM', icon:'message-square-text'}
@@ -6175,7 +6203,7 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'skill' ? tr('canvas.skillNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'].includes(node.type) && node.runStatus
@@ -6329,6 +6357,7 @@ function renderNode(node){
         body.innerHTML = `<div class="text-[11px] text-gray-400">${promptNodes.length} ${tr('canvas.promptCount')} ${tr('canvas.grouped')}</div>`;
     }
     if(node.type === 'llm') body.appendChild(renderLLMBody(node));
+    if(node.type === 'skill') body.appendChild(renderSkillBody(node));
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
     if(node.type === 'midjourney') body.appendChild(renderMidjourneyBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
@@ -6538,6 +6567,7 @@ function refreshOutputNodeContent(node){
 function defaultNodeSize(type){
     if(type === 'image') return {w:260, h:336};
     if(type === 'prompt') return {w:310, h:0};
+    if(type === 'skill') return {w:300, h:0};
     if(type === 'loop') return {w:336, h:0};
     if(type === 'llm') return {w:420, h:590};
     if(type === 'generator') return {w:380, h:0};
@@ -8321,6 +8351,119 @@ function llmInputVideos(node){
     });
     return urls;
 }
+// ===== 生图 Skill 节点（PRD FR2-5~FR2-9）=====
+// Skill 是指令文档包：节点只选择与连线，编译在生成时进行（fast=后端拼接 / llm=LLM 改写+缓存）。
+let skillLibraryCache = {list: [], loaded: false};
+async function loadSkillLibrary(force=false){
+    if(skillLibraryCache.loaded && !force) return skillLibraryCache.list;
+    try {
+        const data = await fetch('/api/skills').then(r => r.ok ? r.json() : {skills:[]});
+        skillLibraryCache.list = (data.skills || []).filter(s => s.has_skill_md && ['custom','builtin'].includes(s.source));
+        skillLibraryCache.loaded = true;
+    } catch(e) {
+        skillLibraryCache.list = [];
+    }
+    return skillLibraryCache.list;
+}
+function connectedSkillSource(gen){
+    return connections.filter(c => c.to === gen.id)
+        .map(c => nodes.find(n => n.id === c.from))
+        .find(n => n && n.type === 'skill' && n.skillId) || null;
+}
+function skillOptionsHtml(node){
+    const selected = `${node.skillSource || 'custom'}:${node.skillId || ''}`;
+    const options = [`<option value="" ${node.skillId ? '' : 'selected'}>${tr('canvas.skillNone')}</option>`];
+    for(const source of ['custom', 'builtin']){
+        const group = skillLibraryCache.list.filter(s => s.source === source);
+        if(!group.length) continue;
+        options.push(`<optgroup label="${escapeHtml(source === 'custom' ? tr('canvas.skillGroupCustom') : tr('canvas.skillGroupBuiltin'))}">`);
+        group.forEach(s => {
+            const value = `${s.source}:${s.id}`;
+            options.push(`<option value="${escapeHtml(value)}" ${value === selected ? 'selected' : ''}>${escapeHtml(s.name || s.id)}${s.version ? ` v${escapeHtml(s.version)}` : ''}</option>`);
+        });
+        options.push('</optgroup>');
+    }
+    return options.join('');
+}
+function renderSkillBody(node){
+    const wrap = document.createElement('div');
+    wrap.className = 'skill-node-body';
+    wrap.innerHTML = `
+        <select class="select-lite skill-select mb-2">${skillOptionsHtml(node)}</select>
+        <div class="skill-mode-row">
+            <button type="button" class="skill-mode-btn ${node.skillMode !== 'llm' ? 'active' : ''}" data-mode="fast">${tr('canvas.skillFast')}</button>
+            <button type="button" class="skill-mode-btn ${node.skillMode === 'llm' ? 'active' : ''}" data-mode="llm">${tr('canvas.skillSmart')}</button>
+        </div>
+        <div class="skill-mode-hint text-[10.5px] text-gray-400 mt-2 leading-relaxed">${node.skillMode === 'llm' ? tr('canvas.skillSmartHint') : tr('canvas.skillFastHint')}</div>`;
+    const select = wrap.querySelector('.skill-select');
+    select.onmousedown = e => e.stopPropagation();
+    select.onclick = e => e.stopPropagation();
+    select.onchange = e => {
+        e.stopPropagation();
+        const [source, id] = (e.target.value || ':').split(':');
+        node.skillSource = source || 'custom';
+        node.skillId = id || '';
+        const found = skillLibraryCache.list.find(s => s.source === node.skillSource && s.id === node.skillId);
+        node.skillName = found?.name || '';
+        node.skillVersion = found?.version || '';
+        scheduleSave();
+    };
+    wrap.querySelectorAll('.skill-mode-btn').forEach(btn => {
+        btn.onmousedown = e => e.stopPropagation();
+        btn.onclick = e => {
+            e.stopPropagation();
+            node.skillMode = btn.dataset.mode === 'llm' ? 'llm' : 'fast';
+            scheduleSave();
+            render();
+        };
+    });
+    return wrap;
+}
+function showPromptPreviewModal(title, text){
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:24px;';
+    overlay.innerHTML = `<div style="width:min(680px,94vw);max-height:82vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);">
+            <b style="font-size:14px;">${escapeHtml(title)}</b>
+            <button type="button" style="background:transparent;border:0;cursor:pointer;color:var(--muted);font-size:18px;line-height:1;">✕</button>
+        </div>
+        <pre style="margin:0;padding:14px 16px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:var(--text);">${escapeHtml(text)}</pre>
+    </div>`;
+    const close = () => overlay.remove();
+    overlay.addEventListener('mousedown', e => { if(e.target === overlay) close(); });
+    overlay.querySelector('button').addEventListener('click', close);
+    document.body.appendChild(overlay);
+}
+async function previewCompiledPrompt(gen, promptText){
+    const skillNode = connectedSkillSource(gen);
+    if(!skillNode || !promptText?.trim()){
+        showPromptPreviewModal(tr('canvas.skillPreview'), promptText || tr('canvas.skillNoPrompt'));
+        return;
+    }
+    try {
+        const data = await fetch('/api/skills/preview-prompt', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({source:skillNode.skillSource || 'custom', id:skillNode.skillId, mode:skillNode.skillMode || 'fast', prompt:promptText.slice(0, 4000)})
+        }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
+        if(data.mode === 'fast'){
+            showPromptPreviewModal(`${tr('canvas.skillPreview')} · ${skillNode.skillName || skillNode.skillId}`, data.compiled_prompt);
+        } else {
+            showPromptPreviewModal(tr('canvas.skillPreview'), tr('canvas.skillSmartPreviewNote'));
+        }
+    } catch(err) {
+        showLightToast((err.message || tr('canvas.generationFailed')).slice(0, 200), 4200);
+    }
+}
+function renderSkillLine(gen){
+    const skillNode = connectedSkillSource(gen);
+    if(!skillNode) return '';
+    const modeLabel = skillNode.skillMode === 'llm' ? tr('canvas.skillSmart') : tr('canvas.skillFast');
+    return `<div class="gen-skill-line" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;padding:6px 9px;border:1px dashed var(--line-2);border-radius:9px;font-size:11.5px;color:var(--muted);flex-wrap:wrap;">
+        <span>✨ ${escapeHtml(skillNode.skillName || skillNode.skillId)} · ${escapeHtml(modeLabel)}</span>
+        <button type="button" class="skill-preview-btn" style="margin-left:auto;padding:2px 8px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--muted);font-size:11px;cursor:pointer;">${tr('canvas.skillPreview')}</button>
+    </div>`;
+}
+
 function renderGeneratorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
@@ -8331,6 +8474,7 @@ function renderGeneratorBody(node){
     sanitizeImageNodeProviderModel(node);
     normalizeApiNodeSizeChoice(node);
     wrap.innerHTML = `
+        ${renderSkillLine(node)}
         <div class="prompt-list mb-3"></div>
         <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">${tr('canvas.images')}</div>
         <div class="input-list"></div>
@@ -8633,6 +8777,13 @@ function renderGeneratorBody(node){
     renderImageInputList(list, node, mediaInputs);
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    const skillPreviewBtn = wrap.querySelector('.skill-preview-btn');
+    if(skillPreviewBtn){
+        skillPreviewBtn.onclick = e => {
+            e.stopPropagation();
+            previewCompiledPrompt(node, ordered.map(s => s.prompt).filter(Boolean).join('\n\n'));
+        };
+    }
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
@@ -11172,6 +11323,9 @@ function mediaRefsFromNode(node){
 }
 function generatorSources(gen){
     return connections.filter(c => c.to === gen.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
+        if(n.type === 'skill'){
+            return {id:n.id, type:'skill', label:tr('canvas.skillNode'), preview:'', refs:[], prompt:'', skill:{source:n.skillSource || 'custom', id:n.skillId, mode:n.skillMode || 'fast', name:n.skillName || '', version:n.skillVersion || ''}};
+        }
         if(n.type === 'output' && (n.images||[]).length){
             // 从 output 节点取最新一张图当作 reference 给下游
             const reversed = [...n.images].map((item, index) => ({item, index})).reverse();
@@ -11327,6 +11481,7 @@ async function runGenerator(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
+    const skillSource = sources.find(s => s.type === 'skill' && s.skill?.id);
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
@@ -11341,6 +11496,7 @@ async function runGenerator(genId, opts={}){
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
+    if(skillSource) payload.skill = {source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode};
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
     let pendingIds = [];
@@ -13375,6 +13531,8 @@ function requestMetaFromResult(result={}){
         prompt_id: result.prompt_id || '',
         workflow_json: result.workflow_json || '',
         seed: result.seed || '',
+        skill_used: result.skill_used || null,
+        compiled_prompt: result.compiled_prompt || '',
         image_model_requested: result.image_model_requested || '',
         image_model_observed: result.image_model_observed || '',
         image_model_confirmed: Boolean(result.image_model_confirmed),
@@ -16123,6 +16281,7 @@ window.onload = async () => {
     initOutputPreviewZoomEvents();
     applyViewport();
     await loadConfig();
+    loadSkillLibrary();
     pruneMissingComfyWorkflows();
     // 编辑器页只负责打开单个画布：必须带 ?id；没有 id 就回到独立的选画布页面。
     const openId = new URLSearchParams(window.location.search).get('id');
