@@ -1744,12 +1744,31 @@ def sync_static_html_versions():
     except Exception as e:
         print(f"同步静态页面版本号失败: {e}")
 
+CURSOR_STYLESHEET = '/static/css/cursor.css'
+
+
+def inject_cursor_stylesheet(html: str) -> str:
+    """把手型光标样式挂到页面 </head> 之前。
+
+    系统原生手型光标在浅色主题下会丢失黑色描边，白色光标与白色背景融为一体。
+    cursor.css 用自带黑边的 SVG 光标替代它。之所以在这里统一注入而不是写进各个
+    HTML，是因为所有页面都经过 static_html_response 出口，且插在 </head> 前可以保证
+    它排在页面自身样式表之后——cursor.css 里的 !important 规则在权重打平时需要靠
+    加载顺序取胜。页面若没有 </head> 则原样返回，不影响渲染。"""
+    if CURSOR_STYLESHEET in html:
+        return html
+    idx = html.lower().rfind("</head>")
+    if idx < 0:
+        return html
+    return f'{html[:idx]}<link rel="stylesheet" href="{CURSOR_STYLESHEET}">\n{html[idx:]}'
+
+
 def static_html_response(filename: str):
     path = os.path.join(STATIC_DIR, filename)
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     return Response(
-        versioned_static_html(html),
+        versioned_static_html(inject_cursor_stylesheet(html)),
         media_type="text/html; charset=utf-8",
         headers={"Cache-Control": "no-cache"},
     )

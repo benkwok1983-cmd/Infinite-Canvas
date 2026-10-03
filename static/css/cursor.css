@@ -1,0 +1,297 @@
+/* 手型光标可见性修复
+ * ------------------------------------------------------------------
+ * 问题：原先全站使用系统原生手型光标（pointer / grab / grabbing）。
+ * 原生光标的白色填充与黑色描边完全由 Windows / Chromium 绘制，页面无法干预；
+ * 当页面切到浅色主题（白底）而系统渲染出的光标丢失了黑色描边时，
+ * 白色光标会与白色背景融为一体，导致“找不到鼠标”。
+ *
+ * 方案：改用自带描边的 SVG 手型光标 —— 浅色主题下白色填充 + 黑色描边。
+ * 白色填充在深色背景上清晰，黑色描边在浅色背景上清晰，两种主题下都能看见。
+ * 深色主题（html.theme-dark）自动换成深填充 + 白描边，否则黑边会糊进深色背景。
+ * 每条 cursor 声明都保留了原生关键字作为回退（SVG 加载失败时行为与改动前一致）。
+ *
+ * 图形来源：pointer 的形状直接取自 Windows 11 官方矢量 C:\Windows\Cursors\link.svg，
+ * 仅加 translate(0,32) scale(1,-1) 做垂直翻转（原图手背朝上、手指向下）；
+ * grab / grabbing 没有官方矢量，按 Windows 的扁平指关节风格重绘。
+ * 热点坐标对应各图形的指尖 / 拳心位置，与旧的位图光标保持一致的指向习惯。
+ *
+ * 维护提示：
+ * 1) 选择器清单由脚本依据代码库中现有的 `cursor: pointer` / `cursor: grab` 规则生成
+ *    （扫 static/css、static/*.html、static/js —— JS 里也有运行时注入的样式）；
+ *    新增界面若未命中，仍会回退到系统原生光标（不影响任何功能）。
+ * 2) 不要在下面的选择器列表里加入 ::-moz-* 这类 Chrome 不认识的伪元素——
+ *    选择器列表中只要有一个非法项，整条规则都会被浏览器丢弃（已踩过这个坑）。
+ */
+:root {
+    --ic-hand: url("/static/images/cursor/pointer.svg") 8 1, pointer;
+    --ic-grab: url("/static/images/cursor/grab.svg") 14 3, grab;
+    --ic-grabbing: url("/static/images/cursor/grabbing.svg") 16 20, grabbing;
+}
+
+/* 深色主题：深色填充 + 白色描边。html 上没有 theme-dark 时这段不生效，
+   浅色主题仍然使用上面 :root 里的白填充黑边版本。 */
+html.theme-dark {
+    --ic-hand: url("/static/images/cursor/pointer-dark.svg") 8 1, pointer;
+    --ic-grab: url("/static/images/cursor/grab-dark.svg") 14 3, grab;
+    --ic-grabbing: url("/static/images/cursor/grabbing-dark.svg") 16 20, grabbing;
+}
+
+/* 1) 通用可交互元素 */
+a[href]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+summary:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+label:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+option:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="button"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="tab"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="menuitem"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="option"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="switch"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="checkbox"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="radio"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="slider"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="link"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="treeitem"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="gridcell"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+[role="combobox"]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=button]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=submit]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=reset]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=checkbox]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=radio]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=range]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=file]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=color]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+input[type=image]:not(:where(:disabled,[disabled],[aria-disabled="true"])) {
+    cursor: var(--ic-hand) !important;
+}
+
+/* 2) 代码库中自定义的可点击元素 */
+#distance::-webkit-slider-thumb,
+#rotate-h::-webkit-slider-thumb,
+#rotate-v::-webkit-slider-thumb,
+.asset-manager-tools button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.asset-manager-tools label:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.blank-image:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.canvas-color-swatch:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.canvas-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.canvas-owner-chip:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.canvas-preview-mark:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.canvas-video-play:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.check-toggle:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.classification-chips button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.codex-fallback-row:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.compare-thumbs .compare-thumb:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.compare-toggle:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.connection-layer .conn-cut:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.connection-layer .conn-hit:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.dice-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.engine-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.engine-select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.gate-back-link:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.gate-sort-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.gnode rect:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.graph-ctrl-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.hbm-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.image-edit-route-wrap select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.image-request-mode-wrap select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.input-thumb:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.jimeng-pending-query:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.kind-toggle button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.llm-bubble-copy:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.llm-copy-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.log-thumbs img:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.log-thumbs video:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.logo-ring:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.loop-smart-token-chip button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.loop-token-chip button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mention-option:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mini-image-drop:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mini-x:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimap-arrange-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-canvas-workbench .minimax-material-card:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-canvas-workbench .minimax-ref-clip:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-canvas-workbench .minimax-settings select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-canvas-workbench .minimax-tl-clip:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-canvas-workbench button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-engine-select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-ref-slot.add:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-run:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-segment:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-segment-editor textarea:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-segment-fields input:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-settings input:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-settings select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-timeline-actions button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-tl-clip:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-workbench .minimax-settings select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mode-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.model-protocol-select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.nav-fold-toggle:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.nav-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.node-card-head:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.node-retry-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.node-stop-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.nodes-toggle:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.onboarding-default-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.onboarding-fill-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.opt-del:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.output-del:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.output-file-wrap:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.output-grid video:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.output-recover-query:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pfield-bool-track:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pfield-image-drop:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.picker-cat-tab:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.picker-close:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.picker-row:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.popup-close:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-canvas:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-gap-menu-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-icon-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-number-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-seek-bar:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-seek-bar::-webkit-slider-thumb,
+.pr-segment:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-settings-close-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-settings-select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-settings-toggle-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-strength-slider:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-strength-slider::-webkit-slider-thumb,
+.pr-zoom-slider:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.pr-zoom-slider::-webkit-slider-thumb,
+.project-version-badge:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.protocol-selector-wrap select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.random-toggle:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.rh-app-field-card:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.rh-editor-gnode:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.rh-thumb:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.setting-check:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.side-pill:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.skill-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.skill-check-row:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.skill-icon-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.skill-mini-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.skill-mode-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.skill-tabs button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.small-select:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.smart-back:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.smart-log-lightbox-close:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.smart-node-floating-menu button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.smart-pill:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.smart-video-play:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.storage-file-card:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.studio-modal-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.studio-modal-close:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.thumb-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.update-source-card:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.workflow-import-drop:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-cancel-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-card:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-card-delete-actions button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-card-menu:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-confirm-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-create-cancel:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-create-confirm:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-create-toggle-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-icon-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-mini-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-paste-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-pop-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-pop-proj:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-primary-btn:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-proj-act:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-project-row:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-side-add:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-trash-act:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-trash-confirm-actions button:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-trash-entry:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+body.history-bulk-selecting [data-history-ts]:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+button:not(:where(:disabled,[disabled],[aria-disabled="true"])) {
+    cursor: var(--ic-hand) !important;
+}
+
+/* 3) 画布上可拖拽的区域：grab */
+.asset-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.asset-lightbox.zoomed .asset-lightbox-image:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.board:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.canvas-asset-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.crop-canvas.outpaint-mode img:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.graph-svg-wrap:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.grid-join-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.image-node.has-image .image-preview-wrap:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.image-node.has-image .node-body:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.image-node.has-image img:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.input-item:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mini-canvas:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mini-card-head:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-lane:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-material-card:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-media:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-player-card .minimax-top:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-player-card .minimax-track:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-top:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-track:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.minimax-wb-toolbar:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.model-drag:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.output-preview:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.preview-stage:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.preview-stage.panorama-on:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.provider-card-sortable:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.rh-editor-graph-wrap:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.shell:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.smart-group-member-grab:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.studio-preview-frame:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-board:not(:where(:disabled,[disabled],[aria-disabled="true"])) {
+    cursor: var(--ic-grab) !important;
+}
+
+/* 4) 按下拖拽的瞬间切到 grabbing（:active 提升权重，压过上面的 grab） */
+ {
+    cursor: var(--ic-grabbing) !important;
+}
+
+/* 5) 显式声明 grabbing 的元素（如拖拽中的 .panning 态） */
+.asset-lightbox.dragging .asset-lightbox-image:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.crop-canvas.outpaint-mode.dragging-image img:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.graph-svg-wrap.is-panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.grid-join-item.dragging:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.mini-canvas.is-panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.output-preview.panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.preview-stage.panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.preview-stage.panorama-on.panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.rh-editor-graph-wrap.is-panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.shell.panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.studio-preview-frame.panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-board.panning:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+.ws-card.dragging:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+body.canvas-board-pan:not(:where(:disabled,[disabled],[aria-disabled="true"])),
+body.canvas-board-pan *:not(:where(:disabled,[disabled],[aria-disabled="true"])) {
+    cursor: var(--ic-grabbing) !important;
+}
+
+/* 6) Tailwind 工具类形式的手型光标声明（class 而非 CSS 规则，上面按规则扫描抓不到） */
+.cursor-pointer {
+    cursor: var(--ic-hand) !important;
+}
+
+.cursor-grab {
+    cursor: var(--ic-grab) !important;
+}
+
+.cursor-grabbing {
+    cursor: var(--ic-grabbing) !important;
+}
+
+/* 7) 平移状态由 JS 给 body 加 .canvas-board-pan；重复类名提高权重以覆盖原规则 */
+body.canvas-board-pan.canvas-board-pan,
+body.canvas-board-pan.canvas-board-pan * {
+    cursor: var(--ic-grabbing) !important;
+}
+
+/* 8) 唯一一处由 JS 用 !important 声明 pointer 的规则，重复类名把权重提上去压过它 */
+body.history-bulk-selecting body.history-bulk-selecting [data-history-ts] {
+    cursor: var(--ic-hand) !important;
+}
