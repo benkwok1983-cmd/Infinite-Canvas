@@ -1,0 +1,46 @@
+# ── 密钥与本地凭据 ─────────────────────────────────────────────
+# API/.env 里保存着各平台真实的 API Key（MODELSCOPE_API_KEY、
+# ARK_API_KEY、VOLCENGINE_SECRET_ACCESS_KEY 等），绝不能进版本库。
+# 结构说明见 API/.env.example；把真实值复制到 API/.env 即可。
+API/.env
+.env
+.env.local
+*.env
+!.env.example
+
+# ── 运行时数据（每个用户本地生成，不应共享）────────────────────
+data/api_providers.json
+data/projects.json
+data/prompt_libraries.json
+data/skill_compile_cache.json
+data/canvases/
+data/conversations/
+data/media_previews/
+data/update_backups/
+history.json
+output/
+logs/
+
+# ── 捆绑的 Python 运行时 ───────────────────────────────────────
+# 体积数千文件，属于本机安装产物，不进版本库。
+python/
+.venv/
+venv/
+
+# ── Python 缓存 ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── 日志与诊断输出 ─────────────────────────────────────────────
+*.log
+_self_restart.log
+cli-diagnostic.*.log
+helper-verification.*.log
+install-verification.*.log
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
