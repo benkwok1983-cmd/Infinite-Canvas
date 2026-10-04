@@ -63,6 +63,10 @@ class AtomicWriteJsonTests(unittest.TestCase):
                 try:
                     with open(target, "r", encoding="utf-8") as f:
                         seen.append(json.load(f)["payload"][0])
+                except PermissionError:
+                    # Windows 上 os.replace 生效的瞬间目标文件不可读，这是平台
+                    # 特性而非数据损坏。读者遇到时重试，与线上请求的行为一致。
+                    seen.append("BUSY")
                 except FileNotFoundError:
                     seen.append("MISSING")
                 except Exception as exc:
@@ -82,10 +86,14 @@ class AtomicWriteJsonTests(unittest.TestCase):
             t.join()
 
         self.assertGreater(len(seen), 10, "reader 没跑到足够次数，用例无效")
+        # 合法结果只有三种：读到完整的旧值、读到完整的新值、或 Windows 上恰好
+        # 撞在 os.replace 的瞬间读不到文件（BUSY/MISSING）。
+        # 任何 JSON 解析失败或半截内容才是"写坏了"——那正是本用例要拦截的。
         self.assertEqual(
-            set(seen) - {"x", "y"}, set(),
-            f"读到了中间态/文件缺失：{sorted(set(seen))}",
+            set(seen) - {"x", "y", "BUSY", "MISSING"}, set(),
+            f"读到了中间态/损坏内容：{sorted(set(seen))}",
         )
+        self.assertNotIn("MISSING", seen, "目标文件不应消失：os.replace 是原子替换")
 
     def test_trailing_newline_option(self):
         target = os.path.join(self.dir, "data.json")
