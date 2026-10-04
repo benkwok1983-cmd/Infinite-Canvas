@@ -776,6 +776,9 @@ function syncEditor(){
             ? 'general'
             : (imageEditRouteInput?.value || item.image_edit_route)
     );
+    if(selectedProtocol === 'codex'){
+        item.allow_api_fallback = Boolean(document.getElementById('codexApiFallback')?.checked);
+    }
     item.image_generation_endpoint = '';
     item.image_edit_endpoint = '';
     item.rh_apps = normalizeRhEntries(item.rh_apps || [], 'app');
@@ -2547,6 +2550,8 @@ function renderEditor(){
     document.body.classList.toggle('show-jimeng', isJimeng);
     document.body.classList.toggle('show-codex', isCodex);
     document.body.classList.toggle('show-gemini-cli', isGeminiCli);
+    const codexApiFallbackInput = document.getElementById('codexApiFallback');
+    if(codexApiFallbackInput) codexApiFallbackInput.checked = Boolean(item.allow_api_fallback);
     updateApimartDomesticHint(item);
     renderProviderOnboarding(item);
     renderRecommendApi();
@@ -3791,6 +3796,7 @@ async function saveProviders(){
                 volcengine_region:item.id === 'volcengine' ? (item.volcengine_region || VOLCENGINE_DEFAULT_REGION) : '',
                 volcengine_access_key_id:item.volcengine_access_key_id || undefined,
                 volcengine_secret_access_key:item.volcengine_secret_access_key || undefined,
+                allow_api_fallback:(String(item.protocol || '').toLowerCase() === 'codex') ? Boolean(item.allow_api_fallback) : false,
                 api_key:item.api_key || undefined,
                 wallet_api_key:item.wallet_api_key || undefined,
                 clear_key:item._clearKey === true,

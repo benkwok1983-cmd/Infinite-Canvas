@@ -466,9 +466,10 @@ function openCanvas(c){
     const enc = encodeURIComponent(c.id);
     const project = encodeURIComponent(c.project || currentProjectId || 'default');
     rememberProjectId(c.project || currentProjectId || 'default');
+    // 页面级 cache-bust：硬编码旧版本号会让浏览器长期使用缓存的旧页面（改版后用户看不到新功能）
     window.location.href = (c.kind === 'smart')
-        ? `/static/smart-canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`
-        : `/static/canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`;
+        ? `/static/smart-canvas.html?id=${enc}&project=${project}&v=${Date.now()}`
+        : `/static/canvas.html?id=${enc}&project=${project}&v=${Date.now()}`;
 }
 
 /* ===== Card create flow ===== */

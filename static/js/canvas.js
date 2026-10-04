@@ -722,7 +722,18 @@ function providerOptions(selectedId){
 function providerImageModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
-    return uniqueModels(provider?.image_models || []);
+    const models = uniqueModels(provider?.image_models || []);
+    // Codex 订阅通道：始终提供实验性 Image 2.5 档位（服务端可能忽略选择，UI 须标注）
+    if(String(provider?.protocol || '').trim().toLowerCase() === 'codex'){
+        for(const model of CODEX_EXPERIMENTAL_IMAGE_MODELS){
+            if(!models.includes(model)) models.push(model);
+        }
+    }
+    return models;
+}
+const CODEX_EXPERIMENTAL_IMAGE_MODELS = ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'];
+function isExperimentalCodexImageModel(name){
+    return CODEX_EXPERIMENTAL_IMAGE_MODELS.includes(String(name || '').trim().toLowerCase());
 }
 function sanitizeImageNodeProviderModel(node){
     if(!node || node.type !== 'generator') return;
@@ -842,6 +853,19 @@ function showErrorModal(message, title=tr('canvas.generationFailed')){
     errorMessage.textContent = message || title;
     errorModal.classList.add('open');
     refreshIcons();
+}
+function showLightToast(message, duration=3600){
+    let host = document.getElementById('canvasLightToast');
+    if(!host){
+        host = document.createElement('div');
+        host.id = 'canvasLightToast';
+        host.style.cssText = 'position:fixed;left:50%;bottom:76px;transform:translateX(-50%);z-index:9999;background:rgba(15,23,42,.92);color:#f8fafc;padding:10px 16px;border-radius:10px;font-size:13px;line-height:1.5;max-width:min(520px,86vw);box-shadow:0 10px 30px rgba(15,23,42,.25);opacity:0;transition:opacity .25s ease;pointer-events:none;';
+        document.body.appendChild(host);
+    }
+    host.textContent = message;
+    requestAnimationFrame(() => { host.style.opacity = '1'; });
+    clearTimeout(host._hideTimer);
+    host._hideTimer = setTimeout(() => { host.style.opacity = '0'; }, duration);
 }
 function apiErrorMessage(data, fallback='请求失败'){
     if(!data) return fallback;
@@ -1071,7 +1095,7 @@ function imageModelOptions(selectedModel, providerId){
         return `<option value="" disabled selected>${tr('canvas.noImageModelsHint') || '暂无生图模型，请到 API 设置添加'}</option>`;
     }
     const selectedValue = resolveImageModel(selectedModel);
-    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model + (isExperimentalCodexImageModel(model) ? `（${tr('canvas.experimentalTag') || '实验'}）` : ''))}</option>`).join('');
     const hasSelected = models.includes(selectedValue);
     return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
 }
@@ -2561,6 +2585,10 @@ function addLLMNode(point){
         running:false
     });
 }
+function addSkillNode(point){
+    const p = point || defaultPoint(120, 0);
+    return addNode({id:uid('skill'), type:'skill', x:p.x, y:p.y, skillSource:'custom', skillId:'', skillName:'', skillVersion:'', skillMode:'fast', inputs:[]});
+}
 function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
     const providerId = imageApiProviders()[0]?.id || '';
@@ -2759,6 +2787,7 @@ function renderMsGenBody(node){
             ).join('')}
         </div>
         <div class="ms-content">
+            ${renderSkillLine(node)}
             <div class="prompt-list mt-2 mb-2"></div>
             ${msUsesImages ? `
             <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">${tr('canvas.images')}</div>
@@ -3069,6 +3098,13 @@ function renderMsGenBody(node){
     }
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    const msSkillPreviewBtn = wrap.querySelector('.skill-preview-btn');
+    if(msSkillPreviewBtn){
+        msSkillPreviewBtn.onclick = e => {
+            e.stopPropagation();
+            previewCompiledPrompt(node, ordered.map(s => s.prompt).filter(Boolean).join('\n\n'));
+        };
+    }
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
@@ -3077,13 +3113,14 @@ async function runMsGenNode(nodeId, opts={}){
     if(!node || (node.running && !opts.cascade)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
-    const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
+    const skillSource = sources.find(s => s.type === 'skill' && s.skill?.id);
+    let prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     const modelKey = node.msgenModel || 'zimage';
     const msModel = MS_GEN_MODELS[modelKey] || MS_GEN_MODELS.zimage;
     const msModelId = currentMsModelId(modelKey, node);
     const msLoras = modelscopeLorasForModel(msModelId);
-    if(!prompt){ alert(tr('canvas.needPrompt')); return; }
+    if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
     if(msModel.supportsImage && !refs.length){ alert(tr('canvas.needImage')); return; }
     const count = Math.max(1, Math.min(8, Number(node.count || 1)));
     // 链路中间节点默认不创建 Output；链尾、手动开启或已有 Output 连接时才输出。
@@ -3099,13 +3136,47 @@ async function runMsGenNode(nodeId, opts={}){
         height = Number(node.msHeight) || height;
     }
     const requestSize = {width, height};
+    // 转圈卡片必须先于 Skill 编译创建：智能模式的 LLM 编译可能耗时 10-60s，
+    // 否则点击生成后长时间无任何反馈（用户实测反馈）。
     if(out) out._pending = [...(out._pending || []), ...pendingIds.map(id => makePendingForRun(id, run, node, {refs, requestSize, cascadeTargetId}))];
-    if(!opts.cascade){
+    const reEnableAfter = (delay) => { if(!opts.cascade) setTimeout(() => { node.running = false; refreshRunNodes(node, out); }, delay); };
+    if(!skillSource){
+        // 无 skill：保持原时序（2s 后解锁按钮，任务由 pending 卡片追踪）
         node.running = true;
         refreshRunNodes(node, out);
-        setTimeout(() => { node.running = false; refreshRunNodes(node, out); }, 2000);
+        reEnableAfter(2000);
+    } else {
+        // 有 skill：编译期间保持锁定 + 显示「AI 编译中」，防重复点击重复生图
+        node.running = true;
+        node.runStatus = 'compiling';
+        refreshRunNodes(node, out);
     }
-    else refreshRunNodes(node, out);
+    // msgen 走专用端点：skill 在前端预编译后替换 prompt（fast 零成本；llm 走 LLM 有缓存）。
+    // 提示词可选：有参考图 + skill 即可生图（编译产物=skill 指令与所选样板）
+    let skillUsed = null;
+    if(skillSource){
+        try {
+            const compiled = await fetch('/api/skills/compile-prompt', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', model:skillSource.skill.model || '', prompt})
+            }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
+            prompt = compiled.compiled_prompt;
+            skillUsed = {...compiled.skill_used, cached:compiled.cached};
+            run.prompt = prompt;
+            node.runStatus = '';
+            reEnableAfter(2000);
+        } catch(err) {
+            // 编译失败：回收刚创建的转圈卡片并落日志，保持与生成失败同样的反馈
+            if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
+            node.running = false;
+            node.runStatus = 'failed';
+            node.runError = err.message || String(err);
+            refreshRunNodes(node, out);
+            addGenerationLog({run, outputs:[], runMs:0, error:err.message || String(err)});
+            alert((err.message || tr('canvas.generationFailed')).slice(0, 220));
+            return;
+        }
+    }
     try {
         const imageUrls = [];
         if(msModel.supportsImage || msModel.acceptsImage){
@@ -3152,6 +3223,7 @@ async function runMsGenNode(nodeId, opts={}){
         const metas = collectRunMetas(out, pendingIds);
         const outputUrls = results.map(data => data.url).filter(Boolean);
         run.request = results[0] ? requestMetaFromResult(results[0]) : {};
+        if(skillUsed) run.request.skill_used = skillUsed;
         if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
         appendOutputImages(out, outputUrls, refs[0], metas);
         mergeGeneratedOutputs(node, outputUrls, Boolean(opts.cascade));
@@ -3226,6 +3298,12 @@ function linkCreateOptions(state){
     const node = nodes.find(n => n.id === state?.originId);
     if(!node) return [];
     if(state.originKind === 'out'){
+        if(node.type === 'skill'){
+            return [
+                {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
+                {type:'msgen', label:tr('canvas.modelscopeGenerate'), icon:'cloud-lightning'}
+            ];
+        }
         if(['image','prompt','loop','group','promptGroup','llm','output'].includes(node.type)){
             return [
                 {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
@@ -3245,6 +3323,7 @@ function linkCreateOptions(state){
         return [
             {type:'image', label:tr('canvas.imageCard'), icon:'image-plus'},
             {type:'prompt', label:tr('canvas.prompt'), icon:'text-cursor-input'},
+            {type:'skill', label:tr('canvas.skillNode'), icon:'sparkles'},
             {type:'loop', label:tr('canvas.loopNode'), icon:'repeat-2'},
             {type:'group', label:tr('canvas.group'), icon:'group'},
             {type:'llm', label:'LLM', icon:'message-square-text'}
@@ -3603,6 +3682,7 @@ function createLinkedNode(type){
 function createNodeByType(type, point){
     if(type === 'image') return addImageNode(point);
     if(type === 'prompt') return addPromptNode(point);
+    if(type === 'skill') return addSkillNode(point);
     if(type === 'loop') return addLoopNode(point);
     if(type === 'group') return addGroupNode(point);
     if(type === 'llm') return addLLMNode(point);
@@ -3621,6 +3701,7 @@ function menuAdd(type){
     closeCreateMenu();
     if(type === 'image') addImageNode(menuPoint);
     if(type === 'prompt') addPromptNode(menuPoint);
+    if(type === 'skill') addSkillNode(menuPoint);
     if(type === 'loop') addLoopNode(menuPoint);
     if(type === 'llm') addLLMNode(menuPoint);
     if(type === 'generator') addGeneratorNode(menuPoint);
@@ -6151,13 +6232,13 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'skill' ? tr('canvas.skillNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'].includes(node.type) && node.runStatus
         && (node.runStatus !== 'failed' || node._cascadeFailed);
     const statusHtml = showStatus ? (() => {
-        const label = { queued:'排队中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
+        const label = { queued:'排队中', compiling:'AI 编译中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
         return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${node._cascadeIdx?' '+node._cascadeIdx:''}</span>`;
     })() : '';
     el.innerHTML = `<div class="node-head"><span class="node-title">${displayTitle}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}<button onclick="deleteNodeFromButton('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
@@ -6305,6 +6386,7 @@ function renderNode(node){
         body.innerHTML = `<div class="text-[11px] text-gray-400">${promptNodes.length} ${tr('canvas.promptCount')} ${tr('canvas.grouped')}</div>`;
     }
     if(node.type === 'llm') body.appendChild(renderLLMBody(node));
+    if(node.type === 'skill') body.appendChild(renderSkillBody(node));
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
     if(node.type === 'midjourney') body.appendChild(renderMidjourneyBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
@@ -6333,7 +6415,7 @@ function renderNode(node){
         startNodeDrag(e, node);
     };
     const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh','minimax'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','output'].includes(node.type);
+    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','output','skill'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
@@ -6514,6 +6596,7 @@ function refreshOutputNodeContent(node){
 function defaultNodeSize(type){
     if(type === 'image') return {w:260, h:336};
     if(type === 'prompt') return {w:310, h:0};
+    if(type === 'skill') return {w:300, h:0};
     if(type === 'loop') return {w:336, h:0};
     if(type === 'llm') return {w:420, h:590};
     if(type === 'generator') return {w:380, h:0};
@@ -8297,6 +8380,175 @@ function llmInputVideos(node){
     });
     return urls;
 }
+// ===== 生图 Skill 节点（PRD FR2-5~FR2-9）=====
+// Skill 是指令文档包：节点只选择与连线，编译在生成时进行（fast=后端拼接 / llm=LLM 改写+缓存）。
+let skillLibraryCache = {list: [], loaded: false, fetchedAt: 0, fetching: false};
+const SKILL_LIBRARY_TTL = 60 * 1000;
+async function loadSkillLibrary(force=false){
+    if(skillLibraryCache.fetching) return skillLibraryCache.list;
+    if(skillLibraryCache.loaded && !force && Date.now() - skillLibraryCache.fetchedAt < SKILL_LIBRARY_TTL) return skillLibraryCache.list;
+    skillLibraryCache.fetching = true;
+    try {
+        const data = await fetch('/api/skills').then(r => r.ok ? r.json() : {skills:[]});
+        skillLibraryCache.list = (data.skills || []).filter(s => s.has_skill_md && ['custom','builtin'].includes(s.source));
+        skillLibraryCache.loaded = true;
+        skillLibraryCache.fetchedAt = Date.now();
+        // 库异步就绪后重渲染：已选 skill 的下拉/样板菜单正确回显（含管理页改动后自动跟进）
+        if(typeof nodes !== 'undefined' && nodes.some(n => n.type === 'skill')) render();
+    } catch(e) {
+        skillLibraryCache.list = skillLibraryCache.loaded ? skillLibraryCache.list : [];
+    } finally {
+        skillLibraryCache.fetching = false;
+    }
+    return skillLibraryCache.list;
+}
+function ensureSkillLibraryFresh(){
+    // 画布与管理页是两个页面：管理页改动样板后，画布靠 TTL 过期自动拉新
+    if(Date.now() - (skillLibraryCache.fetchedAt || 0) > SKILL_LIBRARY_TTL) loadSkillLibrary(true);
+}
+function connectedSkillSource(gen){
+    return connections.filter(c => c.to === gen.id)
+        .map(c => nodes.find(n => n.id === c.from))
+        .find(n => n && n.type === 'skill' && n.skillId) || null;
+}
+function skillOptionsHtml(node){
+    const selected = `${node.skillSource || 'custom'}:${node.skillId || ''}`;
+    const options = [`<option value="" ${node.skillId ? '' : 'selected'}>${tr('canvas.skillNone')}</option>`];
+    for(const source of ['custom', 'builtin']){
+        const group = skillLibraryCache.list.filter(s => s.source === source);
+        if(!group.length) continue;
+        options.push(`<optgroup label="${escapeHtml(source === 'custom' ? tr('canvas.skillGroupCustom') : tr('canvas.skillGroupBuiltin'))}">`);
+        group.forEach(s => {
+            const value = `${s.source}:${s.id}`;
+            options.push(`<option value="${escapeHtml(value)}" ${value === selected ? 'selected' : ''}>${escapeHtml(s.name || s.id)}${s.version ? ` v${escapeHtml(s.version)}` : ''}</option>`);
+        });
+        options.push('</optgroup>');
+    }
+    return options.join('');
+}
+function skillLlmModelOptionsHtml(node){
+    const codex = (apiProviders || []).find(p => p.id === 'codex' || String(p.protocol || '').toLowerCase() === 'codex');
+    const models = (codex?.chat_models || []).filter(Boolean);
+    if(!models.length) return '';
+    const selected = node.skillModel || models[0];
+    return `<select class="select-lite skill-llm-model-select mb-2" title="${escapeHtml(tr('canvas.skillLlmModel'))}">
+        ${models.map(m => `<option value="${escapeHtml(m)}" ${m === selected ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+    </select>`;
+}
+function skillVariantOptionsHtml(node){
+    const found = skillLibraryCache.list.find(s => s.source === (node.skillSource || 'custom') && s.id === node.skillId);
+    const variants = found?.variants || [];
+    if(!variants.length) return '';
+    const selected = node.skillVariant || '';
+    return `<select class="select-lite skill-variant-select mb-2">
+        <option value="" ${!selected ? 'selected' : ''}>${escapeHtml(tr('canvas.skillVariantAuto'))}</option>
+        ${variants.map(v => `<option value="${escapeHtml(v.id)}" ${v.id === selected ? 'selected' : ''}>${escapeHtml(v.label)}</option>`).join('')}
+    </select>`;
+}
+function renderSkillBody(node){
+    ensureSkillLibraryFresh();
+    const wrap = document.createElement('div');
+    wrap.className = 'skill-node-body';
+    wrap.innerHTML = `
+        <select class="select-lite skill-select mb-2">${skillOptionsHtml(node)}</select>
+        ${skillVariantOptionsHtml(node)}
+        ${node.skillMode === 'llm' ? skillLlmModelOptionsHtml(node) : ''}
+        <div class="skill-mode-row">
+            <button type="button" class="skill-mode-btn ${node.skillMode !== 'llm' ? 'active' : ''}" data-mode="fast">${tr('canvas.skillFast')}</button>
+            <button type="button" class="skill-mode-btn ${node.skillMode === 'llm' ? 'active' : ''}" data-mode="llm">${tr('canvas.skillSmart')}</button>
+        </div>
+        <div class="skill-mode-hint text-[10.5px] text-gray-400 mt-2 leading-relaxed">${node.skillMode === 'llm' ? tr('canvas.skillSmartHint') : tr('canvas.skillFastHint')}</div>`;
+    const select = wrap.querySelector('.skill-select');
+    select.onmousedown = e => e.stopPropagation();
+    select.onclick = e => e.stopPropagation();
+    select.onchange = e => {
+        e.stopPropagation();
+        const [source, id] = (e.target.value || ':').split(':');
+        node.skillSource = source || 'custom';
+        node.skillId = id || '';
+        const found = skillLibraryCache.list.find(s => s.source === node.skillSource && s.id === node.skillId);
+        node.skillName = found?.name || '';
+        node.skillVersion = found?.version || '';
+        node.skillVariant = '';
+        scheduleSave();
+        render();
+    };
+    const llmModelSelect = wrap.querySelector('.skill-llm-model-select');
+    if(llmModelSelect){
+        llmModelSelect.onmousedown = e => e.stopPropagation();
+        llmModelSelect.onclick = e => e.stopPropagation();
+        llmModelSelect.onchange = e => {
+            e.stopPropagation();
+            node.skillModel = e.target.value || '';
+            scheduleSave();
+        };
+    }
+    const variantSelect = wrap.querySelector('.skill-variant-select');
+    if(variantSelect){
+        variantSelect.onmousedown = e => e.stopPropagation();
+        variantSelect.onclick = e => e.stopPropagation();
+        variantSelect.onchange = e => {
+            e.stopPropagation();
+            node.skillVariant = e.target.value || '';
+            scheduleSave();
+        };
+    }
+    wrap.querySelectorAll('.skill-mode-btn').forEach(btn => {
+        btn.onmousedown = e => e.stopPropagation();
+        btn.onclick = e => {
+            e.stopPropagation();
+            node.skillMode = btn.dataset.mode === 'llm' ? 'llm' : 'fast';
+            scheduleSave();
+            render();
+        };
+    });
+    return wrap;
+}
+function showPromptPreviewModal(title, text){
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:24px;';
+    overlay.innerHTML = `<div style="width:min(680px,94vw);max-height:82vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);">
+            <b style="font-size:14px;">${escapeHtml(title)}</b>
+            <button type="button" style="background:transparent;border:0;cursor:pointer;color:var(--muted);font-size:18px;line-height:1;">✕</button>
+        </div>
+        <pre style="margin:0;padding:14px 16px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:var(--text);">${escapeHtml(text)}</pre>
+    </div>`;
+    const close = () => overlay.remove();
+    overlay.addEventListener('mousedown', e => { if(e.target === overlay) close(); });
+    overlay.querySelector('button').addEventListener('click', close);
+    document.body.appendChild(overlay);
+}
+async function previewCompiledPrompt(gen, promptText){
+    const skillNode = connectedSkillSource(gen);
+    if(!skillNode || !promptText?.trim()){
+        showPromptPreviewModal(tr('canvas.skillPreview'), promptText || tr('canvas.skillNoPrompt'));
+        return;
+    }
+    const mode = skillNode.skillMode || 'fast';
+    // 智能模式真实预览会消耗少量 LLM 额度（结果入缓存），先确认（FR2-8 两种模式都要能预览）
+    if(mode === 'llm' && !confirm(tr('canvas.skillSmartPreviewConfirm'))) return;
+    try {
+        const data = await fetch('/api/skills/compile-prompt', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({source:skillNode.skillSource || 'custom', id:skillNode.skillId, mode, variant:skillNode.skillVariant || '', model:skillNode.skillModel || '', prompt:promptText})
+        }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); });
+        const suffix = data.mode === 'llm' ? (data.cached ? tr('canvas.skillCacheHit') : '') : '';
+        showPromptPreviewModal(`${tr('canvas.skillPreview')} · ${skillNode.skillName || skillNode.skillId}${suffix}`, data.compiled_prompt || '');
+    } catch(err) {
+        showLightToast((err.message || tr('canvas.generationFailed')).slice(0, 200), 4200);
+    }
+}
+function renderSkillLine(gen){
+    const skillNode = connectedSkillSource(gen);
+    if(!skillNode) return '';
+    const modeLabel = skillNode.skillMode === 'llm' ? tr('canvas.skillSmart') : tr('canvas.skillFast');
+    return `<div class="gen-skill-line" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;padding:6px 9px;border:1px dashed var(--line-2);border-radius:9px;font-size:11.5px;color:var(--muted);flex-wrap:wrap;">
+        <span>✨ ${escapeHtml(skillNode.skillName || skillNode.skillId)} · ${escapeHtml(modeLabel)}</span>
+        <button type="button" class="skill-preview-btn" style="margin-left:auto;padding:2px 8px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--muted);font-size:11px;cursor:pointer;">${tr('canvas.skillPreview')}</button>
+    </div>`;
+}
+
 function renderGeneratorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
@@ -8307,6 +8559,7 @@ function renderGeneratorBody(node){
     sanitizeImageNodeProviderModel(node);
     normalizeApiNodeSizeChoice(node);
     wrap.innerHTML = `
+        ${renderSkillLine(node)}
         <div class="prompt-list mb-3"></div>
         <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">${tr('canvas.images')}</div>
         <div class="input-list"></div>
@@ -8609,6 +8862,13 @@ function renderGeneratorBody(node){
     renderImageInputList(list, node, mediaInputs);
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    const skillPreviewBtn = wrap.querySelector('.skill-preview-btn');
+    if(skillPreviewBtn){
+        skillPreviewBtn.onclick = e => {
+            e.stopPropagation();
+            previewCompiledPrompt(node, ordered.map(s => s.prompt).filter(Boolean).join('\n\n'));
+        };
+    }
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
@@ -11148,6 +11408,9 @@ function mediaRefsFromNode(node){
 }
 function generatorSources(gen){
     return connections.filter(c => c.to === gen.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
+        if(n.type === 'skill'){
+            return {id:n.id, type:'skill', label:tr('canvas.skillNode'), preview:'', refs:[], prompt:'', skill:{source:n.skillSource || 'custom', id:n.skillId, mode:n.skillMode || 'fast', variant:n.skillVariant || '', model:n.skillModel || '', name:n.skillName || '', version:n.skillVersion || ''}};
+        }
         if(n.type === 'output' && (n.images||[]).length){
             // 从 output 节点取最新一张图当作 reference 给下游
             const reversed = [...n.images].map((item, index) => ({item, index})).reverse();
@@ -11303,19 +11566,24 @@ async function runGenerator(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
+    const skillSource = sources.find(s => s.type === 'skill' && s.skill?.id);
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
     const count = Math.max(1, Math.min(8, Number(gen.count || 1)));
     let out = outputForNode(gen, 460);
-    const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
+    // 有 Skill 时提示词可选（校审 P1-4）：空提示词交给 Skill 编译驱动；无 Skill 保持原 fallback
+    const effectivePrompt = (skillSource && !prompt) ? '' : (prompt || 'Edit the reference images.');
+    const run = runSnapshot(gen, effectivePrompt, refs);
     const payload = {
-        prompt: prompt || 'Edit the reference images.',
+        prompt: effectivePrompt,
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
+        image_model:isExperimentalCodexImageModel(resolveImageModel(gen.model)) ? resolveImageModel(gen.model) : '',
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
+    if(skillSource) payload.skill = {source:skillSource.skill.source, id:skillSource.skill.id, mode:skillSource.skill.mode, variant:skillSource.skill.variant || '', model:skillSource.skill.model || ''};
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
     let pendingIds = [];
@@ -13342,7 +13610,7 @@ function runTaskLabel(run){
     return run?.nodeType || 'Generate';
 }
 function requestMetaFromResult(result={}){
-    return {
+    const meta = {
         task_id: result.task_id || result.raw?.task_id || result.raw?.data?.task_id || (Array.isArray(result.raw?.data) ? result.raw.data[0]?.task_id : '') || '',
         request_id: result.request_id || result.id || result.raw?.id || '',
         provider_id: result.provider_id || result.params?.provider_id || '',
@@ -13350,7 +13618,15 @@ function requestMetaFromResult(result={}){
         prompt_id: result.prompt_id || '',
         workflow_json: result.workflow_json || '',
         seed: result.seed || '',
+        image_model_requested: result.image_model_requested || '',
+        image_model_observed: result.image_model_observed || '',
+        image_model_confirmed: Boolean(result.image_model_confirmed),
+        image_size: Array.isArray(result.image_size) ? result.image_size : null,
     };
+    // Skill 溯源只在真实使用时写入（审查 P3-1：无 skill 时不给日志加空字段）
+    if(result.skill_used) meta.skill_used = result.skill_used;
+    if(result.compiled_prompt) meta.compiled_prompt = result.compiled_prompt;
+    return meta;
 }
 function runPlatformLabel(run){
     const node = run?.node || {};
@@ -13734,6 +14010,9 @@ function completeCanvasImageTask(taskId, result){
         run: pending.run || {},
     };
     meta.run.request = requestMetaFromResult(result);
+    if(result?.image_model_requested && result.image_model_requested !== 'auto/latest' && !result.image_model_confirmed){
+        showLightToast(tr('canvas.imageModelUnconfirmed'));
+    }
     const images = result.images || [];
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     appendOutputImages(out, images, meta.run?.refs?.[0], [meta]);
@@ -15287,6 +15566,17 @@ function canConnect(fromId, toId){
     const from = nodes.find(n => n.id === fromId);
     const to = nodes.find(n => n.id === toId);
     if(!from || !to) return false;
+    // Skill 节点只能作为输入连到生成节点，且每个生成节点至多接一个 Skill（FR2-6）
+    if(from.type === 'skill'){
+        if(!CANVAS_GENERATOR_TYPES.includes(to.type)) return false;
+        const existingSkill = connections.some(c => {
+            if(c.to !== toId || c.from === fromId) return false;
+            const upstream = nodes.find(n => n.id === c.from);
+            return upstream?.type === 'skill';
+        });
+        return !existingSkill;
+    }
+    if(to.type === 'skill') return false;
     if(CANVAS_GENERATOR_TYPES.includes(from.type)){
         if(to.type === 'output') return true;
         if(CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type) && CANVAS_GENERATOR_TYPES.includes(to.type)){
@@ -16091,6 +16381,7 @@ window.onload = async () => {
     initOutputPreviewZoomEvents();
     applyViewport();
     await loadConfig();
+    loadSkillLibrary();
     pruneMissingComfyWorkflows();
     // 编辑器页只负责打开单个画布：必须带 ?id；没有 id 就回到独立的选画布页面。
     const openId = new URLSearchParams(window.location.search).get('id');

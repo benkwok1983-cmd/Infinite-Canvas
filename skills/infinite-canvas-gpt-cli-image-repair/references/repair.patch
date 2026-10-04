@@ -1,0 +1,96 @@
+diff --git a/main.py b/main.py
+index c2e9e1b..0926cc2 100644
+--- a/main.py
++++ b/main.py
+@@ -4910,6 +4910,53 @@ def codex_model_for_exec(model="", fallback=""):
+         return ""
+     return value
+ 
++def codex_config_model():
++    candidates = []
++    codex_home = str(os.getenv("CODEX_HOME") or "").strip()
++    if codex_home:
++        candidates.append(os.path.join(codex_home, "config.toml"))
++    user_profile = str(os.getenv("USERPROFILE") or "").strip()
++    if user_profile:
++        candidates.append(os.path.join(user_profile, ".codex", "config.toml"))
++    fallback_profile = os.path.expanduser("~")
++    if fallback_profile and fallback_profile != user_profile:
++        candidates.append(os.path.join(fallback_profile, ".codex", "config.toml"))
++    for path in dict.fromkeys(candidates):
++        if not path or not os.path.isfile(path):
++            continue
++        try:
++            section = ""
++            with open(path, "r", encoding="utf-8") as f:
++                for raw_line in f:
++                    line = raw_line.strip()
++                    if not line or line.startswith("#"):
++                        continue
++                    if line.startswith("["):
++                        section = line
++                        continue
++                    if section:
++                        continue
++                    match = re.fullmatch(r"model\s*=\s*(\"([^\"\\]*)\"|'([^'\\]*)')\s*(?:#.*)?", line)
++                    if match:
++                        return (match.group(2) if match.group(2) is not None else match.group(3)).strip()
++        except (OSError, UnicodeError):
++            return ""
++    return ""
++
++def codex_image_host_model(model=""):
++    candidates = [
++        codex_env_value("CODEX_IMAGE_HOST_MODEL"),
++        codex_env_value("CODEX_MODEL"),
++        codex_config_model(),
++        model,
++        *(CODEX_DEFAULT_CHAT_MODELS or []),
++    ]
++    for candidate in candidates:
++        value = codex_model_for_exec(candidate)
++        if value:
++            return value
++    return ""
++
+ def codex_decode_output(stdout, stderr):
+     out_text = (stdout or b"").decode("utf-8", errors="replace").strip()
+     err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+@@ -5086,9 +5133,7 @@ def gpt_image_2_skill_model_arg(model="", provider="openai"):
+     low = value.lower()
+     provider = str(provider or "").strip().lower()
+     if provider == "codex":
+-        if not value or low.startswith("$imagegen") or low.startswith("gpt-image"):
+-            return "gpt-5.4"
+-        return value
++        return codex_image_host_model(value)
+     if not value or low.startswith("$imagegen"):
+         return "gpt-image-2"
+     return value
+@@ -5097,17 +5142,19 @@ def gpt_image_2_skill_size_arg(size="", model="", prompt="", provider="openai"):
+     text = " ".join([str(size or ""), str(model or ""), str(prompt or "")]).lower()
+     size_text = str(size or "").strip()
+     if str(provider or "").strip().lower() == "codex":
+-        if "1k" in text or "1024" in text:
+-            return "1K"
++        width, height = parse_size_pair(size_text)
++        if 0 < max(width, height) < 1800:
++            return f"{width}x{height}"
+         if "2k" in text or "2048" in text:
+             return "2K"
+         if "4k" in text or "3840" in text:
+             return "4K"
+-        width, height = parse_size_pair(size_text)
+-        if 0 < max(width, height) < 1800:
+-            return "1K"
+-        if 1800 <= max(width, height) < 3000:
+-            return "2K"
++        if width and height:
++            if max(width, height) < 3000:
++                return "2K"
++            return "4K"
++        if "1k" in text or "1024" in text:
++            return "auto"
+         return "4K"
+     match = re.search(r"(\d{3,5})\s*[x×*]\s*(\d{3,5})", size_text, flags=re.I)
+     if match:

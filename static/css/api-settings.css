@@ -6168,3 +6168,10 @@ html.studio-theme-dark body .recommend-tag.recommend-free-tag svg {
         display:none !important;
     }
 }
+
+/* ===== Codex API 回退开关 ===== */
+.codex-fallback-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:10px 12px; margin-top:10px; border:1px solid var(--line); border-radius:10px; background:var(--panel); cursor:pointer; }
+.codex-fallback-text { display:flex; min-width:0; flex-direction:column; gap:4px; }
+.codex-fallback-row .rh-preview-switch { flex:0 0 auto; margin-top:2px; }
+#codexApiFallback:checked + .codex-fallback-switch { background:var(--accent); }
+#codexApiFallback:checked + .codex-fallback-switch span { background:var(--bg); transform:translateX(16px); }

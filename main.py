@@ -2,6 +2,7 @@ import json
 import uuid
 import base64
 import hashlib
+import ipaddress
 import hmac
 import datetime
 import urllib.request
@@ -163,11 +164,20 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.06.03"
-GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
-GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
-GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
-GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main"
+
+# 本项目是 hero8152/Infinite-Canvas 的 fork，Codex 生图与 Skill 等功能只存在于本 fork。
+# 而更新器不是增量安装：static/ 会被整目录删除后重新拷贝，main.py 也会被整文件替换。
+# 若更新源仍指向原上游仓库，点一次更新就会把 fork 的功能覆盖回上游版本，且不可逆。
+# 因此更新源必须指向本 fork 自己的仓库。
+GITHUB_REPO_URL = "https://github.com/benkwok1983-cmd/Infinite-Canvas"
+GITHUB_BRANCH = "zcode/iteration-01"
+GITHUB_VERSION_URL = f"https://raw.githubusercontent.com/benkwok1983-cmd/Infinite-Canvas/{GITHUB_BRANCH}/VERSION"
+GITHUB_TREE_URL = f"https://api.github.com/repos/benkwok1983-cmd/Infinite-Canvas/git/trees/{GITHUB_BRANCH}?recursive=1"
+GITHUB_RAW_ROOT = f"https://raw.githubusercontent.com/benkwok1983-cmd/Infinite-Canvas/{GITHUB_BRANCH}"
 GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
+
+# ModelScope 更新源同理需要指向本 fork 的发布位置；本 fork 尚未在该站发布时，探测会
+# 失败并在响应里给出 fallback_used，用户能看到"该源不可用"，而不是静默覆盖成上游版本。
 MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
 MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
 # ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
@@ -282,8 +292,7 @@ def save_storage_settings(payload):
     for path in dirs.values():
         os.makedirs(path, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(STORAGE_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(dirs, f, ensure_ascii=False, indent=2)
+    atomic_write_json(STORAGE_SETTINGS_FILE, dirs, indent=2)
     apply_storage_settings(dirs)
     return {"dirs": dirs}
 
@@ -295,6 +304,64 @@ def apply_storage_settings(dirs=None):
     LOCAL_UPLOAD_DIR = dirs.get("local") or LOCAL_UPLOAD_DIR
 
 apply_storage_settings()
+
+def replace_with_retry(src: str, dst: str, *, timeout: float = 5.0) -> None:
+    """os.replace 的带重试版本，用于 Windows。
+
+    Windows 上普通的 open() 不带 FILE_SHARE_DELETE，读者打开目标文件期间
+    os.replace 会直接抛 PermissionError(WinError 5)——即使只是 json.load 读了一瞬间。
+    本项目每个请求都要读画布/会话文件，读者数量不少，不重试的话保存会随机 500。
+    这里在超时窗口内退避重试；读者是短临界区，通常第一次或第二次就成功。
+    退避期间仍持有上面的临时文件，读者看到的始终是旧完整内容。
+    """
+    deadline = time.monotonic() + timeout
+    delay = 0.001
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+
+
+def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = 2,
+                      trailing_newline: bool = False) -> None:
+    """把 JSON 原子地写入磁盘。
+
+    直接 open(path, "w") 会先截断文件、再逐块写内容。如果进程在写到一半时被
+    强杀、断电或磁盘写满，磁盘上会留下半截 JSON，下次读取 json.load 直接失败，
+    用户数据（画布、会话、历史等）就此损坏且无法恢复。
+
+    这里改为：写到同目录下的唯一临时文件 → flush → fsync 确保落盘 →
+    os.replace 原子替换目标文件。os.replace 在同一文件系统内是原子操作，
+    因此目标文件要么是旧的完整内容，要么是新的完整内容，不会出现中间态。
+    必须写在同一个目录——跨文件系统的 rename 不是原子的。
+
+    并发写入同一路径时，每个调用各自持有唯一临时文件，最后一次 replace 生效，
+    不会出现两个写者互相写坏同一个临时文件的问题。
+    """
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            if trailing_newline:
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        replace_with_retry(tmp_path, target)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 QUEUE = []
 QUEUE_LOCK = Lock()
@@ -352,6 +419,9 @@ JIMENG_DEFAULT_VIDEO_MODELS = [
     "seedance2.0mini",
 ]
 CODEX_DEFAULT_IMAGE_MODELS = ["gpt-image-2"]
+# 实验性 2.5 图像模型：仅走 Codex 订阅额度通道，经 request create 注入 tools[].model；
+# 服务端可能忽略该选择并返回别名（gpt-image-2-codex），UI 须如实标注（PRD FR1-1/FR1-5）。
+CODEX_EXPERIMENTAL_IMAGE_MODELS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]
 CODEX_DEFAULT_CHAT_MODELS = ["gpt-5.5"]
 GEMINI_CLI_DEFAULT_IMAGE_MODELS = ["auto"]
 GEMINI_CLI_DEFAULT_CHAT_MODELS = ["auto"]
@@ -1319,6 +1389,7 @@ def normalize_provider(item):
         "rh_workflows": normalize_runninghub_entries(item.get("rh_workflows") or [], "workflow"),
         "volcengine_project_name": volc_project,
         "volcengine_region": volc_region,
+        "allow_api_fallback": bool(item.get("allow_api_fallback", False)),
     }
 
 def load_api_providers():
@@ -1337,8 +1408,7 @@ def load_api_providers():
 def save_api_providers(providers):
     os.makedirs(DATA_DIR, exist_ok=True)
     with GLOBAL_CONFIG_LOCK:
-        with open(API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(providers, f, ensure_ascii=False, indent=2)
+        atomic_write_json(API_PROVIDERS_FILE, providers, indent=2)
 
 def default_runninghub_static_provider():
     return {
@@ -1393,9 +1463,7 @@ def mutate_static_runninghub_provider(mutator):
     changed = mutator(provider)
     if changed is False:
         return False
-    with open(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    atomic_write_json(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, raw, indent=2, trailing_newline=True)
     return True
 
 def sync_runninghub_provider_workflows_to_static_template(provider):
@@ -1557,6 +1625,18 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
+
+@app.get("/static/{page_name}", include_in_schema=False)
+async def static_page_no_cache(page_name: str):
+    """子页面 HTML 禁缓存（StaticFiles 响应会被浏览器启发式缓存，改版后用户拿不到新页面）；
+    js/css/images 等多段路径仍走 StaticFiles（靠 ?v= 版本戳缓存）。
+    注意：必须注册在 mount 之前，否则被 StaticFiles 先匹配。"""
+    if page_name.lower().endswith(".html"):
+        return static_html_response(page_name)
+    path = os.path.join(STATIC_DIR, page_name)
+    if os.path.isfile(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Not Found")
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
@@ -2143,6 +2223,7 @@ def download_modelscope_update_files(staging_root: str) -> List[str]:
             f.write(data)
     return files
 
+
 def safe_update_target(path: str) -> str:
     rel = str(path or "").replace("\\", "/").lstrip("/")
     if not update_allowed_file(rel):
@@ -2287,10 +2368,26 @@ def staged_update_file_list(staging_root: str) -> Tuple[List[str], List[str], Li
 
 UPDATE_SOURCE_LABELS = {"github": "GitHub", "modelscope": "ModelScope"}
 
+# ModelScope 上的 Infinite-Canvas 发布页是原上游仓库 hero8152/daniel8152 的，
+# 里面没有本 fork 的 Codex 生图与 Skill 代码。而更新是整目录替换 static/ 加整文件
+# 替换 main.py，一旦从该源更新就会把 fork 的功能覆盖回上游版本，且备份只能事后补救。
+# 因此本 fork 禁用 ModelScope 更新源；等在 ModelScope 上建立本 fork 的发布页后，
+# 把下面的开关改为 True 并同步更新 MODELSCOPE_* 常量即可恢复。
+ALLOW_MODELSCOPE_UPDATE_SOURCE = False
+
+MODELSCOPE_UPDATE_SOURCE_DISABLED_HINT = (
+    "本项目是上游的 fork，ModelScope 上的发布页仍是上游版本，"
+    "从该源更新会覆盖掉 fork 独有的功能（如 Codex 生图、Skill）。"
+    "请改用 GitHub 源更新。"
+)
+
 def normalize_update_source(value: str) -> str:
     source = str(value or "github").strip().lower()
     if source == "ms":
-        return "modelscope"
+        source = "modelscope"
+    # 禁用源一律回落到 GitHub（指向本 fork），而不是报错，避免更新功能整体不可用。
+    if source == "modelscope" and not ALLOW_MODELSCOPE_UPDATE_SOURCE:
+        return "github"
     if source not in {"github", "modelscope"}:
         return "github"
     return source
@@ -2352,11 +2449,10 @@ def read_update_backup_manifest(backup_dir: str) -> Dict[str, Any]:
         return {}
 
 def write_update_backup_manifest(backup_dir: str, payload: Dict[str, Any]) -> None:
-    path = update_backup_manifest_path(backup_dir)
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(temp_path, path)
+    # 之前用固定的 "<path>.tmp" 作为临时名：并发写同一个 backup 时两个写者会打开
+    # 同一个临时文件互相覆盖，os.replace 拿到的内容可能是拼接出来的坏 JSON，
+    # 后续回滚就找不到可用备份。atomic_write_json 用唯一临时名规避了这一点。
+    atomic_write_json(update_backup_manifest_path(backup_dir), payload, indent=2)
 
 def count_regular_files(path: str) -> int:
     return sum(len(files) for _, _, files in os.walk(path)) if os.path.isdir(path) else 0
@@ -2461,7 +2557,11 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
     source_order = [requested_source]
     if req.fallback:
         other = "modelscope" if requested_source == "github" else "github"
-        source_order.append(other)
+        # 兜底源也要经过 normalize：禁用的源在这里被排除，否则即使主源失败，
+        # 仍会静默回落到上游的 ModelScope 发布页，把 fork 覆盖回上游版本。
+        other = normalize_update_source(other)
+        if other != requested_source and other not in source_order:
+            source_order.append(other)
     try:
         backup_root = ""
         backup_manifest: Dict[str, Any] = {}
@@ -2791,10 +2891,22 @@ class AIReference(BaseModel):
     source_url: str = ""
     originalLocalUrl: str = ""
 
+class SkillSelection(BaseModel):
+    """画布节点选择的 Skill（编译注入入口）。"""
+    source: str = "custom"
+    id: str = Field(min_length=1, max_length=80)
+    mode: str = "fast"
+    variant: str = ""
+    provider: str = ""
+    model: str = ""
+
 class OnlineImageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    # 提示词可选（校审 P1-4）：空提示词时要求 Skill 或参考图至少其一，业务层校验
+    prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
     provider_id: str = "comfly"
     model: str = ""
+    image_model: str = ""
+    skill: Optional[SkillSelection] = None
     size: str = "1024x1024"
     aspect_ratio: str = ""
     resolution: str = ""
@@ -2946,6 +3058,7 @@ class ApiProviderPayload(BaseModel):
     volcengine_region: str = VOLCENGINE_DEFAULT_REGION
     volcengine_access_key_id: Optional[str] = None
     volcengine_secret_access_key: Optional[str] = None
+    allow_api_fallback: bool = False
     api_key: Optional[str] = None
     wallet_api_key: Optional[str] = None
     clear_key: bool = False
@@ -3487,8 +3600,7 @@ def save_to_history(record):
         if "timestamp" not in record:
             record["timestamp"] = time.time()
         history.insert(0, record)
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history[:5000], f, ensure_ascii=False, indent=4)
+        atomic_write_json(HISTORY_FILE, history[:5000], indent=4)
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
@@ -3523,8 +3635,7 @@ def now_ms():
 def save_conversation(user_id, conversation):
     with CONVERSATION_LOCK:
         path = conversation_path(user_id, conversation["id"])
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(conversation, f, ensure_ascii=False, indent=2)
+        atomic_write_json(path, conversation, indent=2)
 
 def new_conversation(user_id, title="新对话"):
     timestamp = now_ms()
@@ -3573,11 +3684,61 @@ def canvas_path(canvas_id):
         raise HTTPException(status_code=400, detail="无效的画布 ID")
     return os.path.join(CANVAS_DIR, f"{cleaned}.json")
 
-def save_canvas(canvas):
-    canvas["updated_at"] = now_ms()
+# 每个画布一把事务锁。
+# 之前所有画布共用一把 CANVAS_LOCK，而且锁只包住"写"这一步，"读 → 比较 → 改 → 写"
+# 整段都在锁外。于是两个并发请求（例如自动保存触发的 touch 与主编辑的 PUT 同时到达）
+# 会各自读到同一份旧快照，后写的把先写的整份覆盖掉，且不留任何痕迹。
+# 现在把整段读-改-放进同一把画布级锁，既杜绝覆盖，又不会让 A 画布的保存阻塞 B 画布。
+CANVAS_TRANSACTION_LOCKS = {}
+CANVAS_TRANSACTION_LOCKS_GUARD = Lock()
+
+def canvas_transaction_lock(canvas_id):
+    key = str(canvas_id or "")
+    with CANVAS_TRANSACTION_LOCKS_GUARD:
+        lock = CANVAS_TRANSACTION_LOCKS.get(key)
+        if lock is None:
+            lock = Lock()
+            CANVAS_TRANSACTION_LOCKS[key] = lock
+        return lock
+
+def next_canvas_updated_at(previous):
+    """返回严格大于 previous 的时间戳。
+
+    原来直接取 now_ms()。同一毫秒里连续两次保存会拿到相同的 updated_at，而客户端
+    的冲突检测用的是 `<` 比较：相等时旧版本照样被接受，冲突检测等于失效；画布列表
+    的排序也会出现并列。这里保证每次至少比上一次大 1。
+    """
+    try:
+        previous = int(previous or 0)
+    except (TypeError, ValueError):
+        previous = 0
+    return max(now_ms(), previous + 1)
+
+def write_canvas(canvas, *, bump_updated_at=True):
+    """把画布落盘。调用方必须已持有该画布的事务锁（canvas_transaction_lock）。"""
+    if bump_updated_at:
+        canvas["updated_at"] = next_canvas_updated_at(canvas.get("updated_at"))
     with CANVAS_LOCK:
-        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
-            json.dump(canvas, f, ensure_ascii=False, indent=2)
+        atomic_write_json(canvas_path(canvas["id"]), canvas, indent=2)
+    return canvas
+
+def save_canvas(canvas):
+    """单画布的读-改-写事务入口：加锁后落盘。"""
+    with canvas_transaction_lock(canvas.get("id")):
+        return write_canvas(canvas)
+
+def mutate_canvas(canvas_id, mutator, *, allow_deleted=False, bump_updated_at=True):
+    """在一个事务里完成"读取 → 修改 → 落盘"，全程持有该画布的事务锁。
+
+    mutator 直接修改传入的 canvas；返回 False 表示本次无需改动、不落盘。
+    任何读到旧快照后要写回的逻辑都必须走这里，否则会覆盖并发写入。
+    bump_updated_at=False 用于刻意不改 updated_at 的写入（打标签、置顶）。
+    """
+    with canvas_transaction_lock(canvas_id):
+        canvas = load_canvas_any(canvas_id) if allow_deleted else load_canvas(canvas_id)
+        if mutator(canvas) is False:
+            return canvas
+        return write_canvas(canvas, bump_updated_at=bump_updated_at)
 
 def normalize_canvas_kind(kind="classic"):
     return "smart" if str(kind or "").strip().lower() == "smart" else "classic"
@@ -3599,8 +3760,7 @@ def load_projects():
 
 def save_projects(projects):
     with CANVAS_LOCK:
-        with open(PROJECTS_PATH, 'w', encoding='utf-8') as f:
-            json.dump({"projects": projects}, f, ensure_ascii=False, indent=2)
+        atomic_write_json(PROJECTS_PATH, {"projects": projects}, indent=2)
 
 def project_record(p):
     return {
@@ -3714,11 +3874,15 @@ def canvas_record(data):
 
 def cleanup_expired_canvas_trash():
     cutoff = now_ms() - CANVAS_TRASH_RETENTION_MS
-    with CANVAS_LOCK:
-        for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
-                continue
-            path = os.path.join(CANVAS_DIR, filename)
+    for filename in os.listdir(CANVAS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(CANVAS_DIR, filename)
+        canvas_id = filename[:-len(".json")]
+        # 逐个画布加锁删除：否则清理线程可能在一个保存事务的读-改-写之间把文件删掉，
+        # 事务随后又把内容写回磁盘，等于绕过了 30 天保留期；反过来若删除与保存
+        # 交错，还会出现删了又出现的画布。
+        with canvas_transaction_lock(canvas_id):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -4910,6 +5074,148 @@ def codex_model_for_exec(model="", fallback=""):
         return ""
     return value
 
+def codex_config_model():
+    candidates = []
+    codex_home = str(os.getenv("CODEX_HOME") or "").strip()
+    if codex_home:
+        candidates.append(os.path.join(codex_home, "config.toml"))
+    user_profile = str(os.getenv("USERPROFILE") or "").strip()
+    if user_profile:
+        candidates.append(os.path.join(user_profile, ".codex", "config.toml"))
+    fallback_profile = os.path.expanduser("~")
+    if fallback_profile and fallback_profile != user_profile:
+        candidates.append(os.path.join(fallback_profile, ".codex", "config.toml"))
+    for path in dict.fromkeys(candidates):
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            section = ""
+            with open(path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("["):
+                        section = line
+                        continue
+                    if section:
+                        continue
+                    match = re.fullmatch(r"model\s*=\s*(\"([^\"\\]*)\"|'([^'\\]*)')\s*(?:#.*)?", line)
+                    if match:
+                        return (match.group(2) if match.group(2) is not None else match.group(3)).strip()
+        except (OSError, UnicodeError):
+            return ""
+    return ""
+
+def codex_image_host_model(model=""):
+    candidates = [
+        codex_env_value("CODEX_IMAGE_HOST_MODEL"),
+        codex_env_value("CODEX_MODEL"),
+        codex_config_model(),
+        model,
+        *(CODEX_DEFAULT_CHAT_MODELS or []),
+    ]
+    for candidate in candidates:
+        value = codex_model_for_exec(candidate)
+        if value:
+            return value
+    return ""
+
+def codex_experimental_image_model(model=""):
+    """UI 选择实验性 2.5 档位时返回其模型 id，否则返回空串。"""
+    value = str(model or "").strip().lower()
+    known = {str(item or "").strip().lower() for item in CODEX_EXPERIMENTAL_IMAGE_MODELS}
+    return value if value in known else ""
+
+def codex_image_request_body(prompt_text, host_model, tool_model="", size_arg="", quality="high"):
+    """构造 Codex responses 原始请求体（与上游 build_codex_image_body 对齐）。
+
+    tool_model 为空 = auto/latest（服务端路由）；background 固定 auto——上游实测
+    显式 transparent 会被后端 400，透明需求靠提示词表达（PRD FR1-4）。
+    """
+    tool = {"type": "image_generation", "background": "auto", "output_format": "png"}
+    if size_arg:
+        tool["size"] = str(size_arg)
+    if quality:
+        tool["quality"] = str(quality)
+    if tool_model:
+        tool["model"] = str(tool_model)
+    return {
+        "model": str(host_model),
+        "instructions": "Generate exactly one image using the image_generation tool.",
+        "store": False,
+        "stream": True,
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": str(prompt_text or "")}]}
+        ],
+        "tools": [tool],
+    }
+
+def parse_codex_observed_image_model(events_text=""):
+    """从 --json-events 事件流（或最终 result JSON）提取服务端实际使用的 image_generation 工具模型。
+
+    优先采信 response.completed 事件：response.created 会原样回显请求值（含实验性 2.5 名），
+    completed 才反映服务端最终路由（上游实测返回别名 gpt-image-2-codex）。
+    """
+    text = str(events_text or "")
+    events = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            continue
+    if not events and text.strip():
+        try:
+            parsed = json.loads(text)
+            events = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            return []
+
+    def find_completed(value):
+        if isinstance(value, dict):
+            if str(value.get("type") or "") == "response.completed":
+                return True
+            return any(find_completed(child) for child in value.values())
+        if isinstance(value, list):
+            return any(find_completed(child) for child in value)
+        return False
+
+    def walk(value, sink):
+        if isinstance(value, dict):
+            response = value.get("response")
+            if isinstance(response, dict):
+                for tool in response.get("tools") or []:
+                    if (
+                        isinstance(tool, dict)
+                        and str(tool.get("type") or "") == "image_generation"
+                        and tool.get("model")
+                    ):
+                        sink.append(str(tool["model"]))
+            for child in value.values():
+                walk(child, sink)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, sink)
+
+    observed_all = []
+    observed_completed = []
+    for event in events:
+        sink = observed_completed if find_completed(event) else observed_all
+        walk(event, sink)
+    return observed_completed or observed_all
+
+def codex_image_dimensions(path=""):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with Image.open(path) as image:
+            return [int(image.width), int(image.height)]
+    except Exception:
+        return None
+
 def codex_decode_output(stdout, stderr):
     out_text = (stdout or b"").decode("utf-8", errors="replace").strip()
     err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
@@ -5086,9 +5392,7 @@ def gpt_image_2_skill_model_arg(model="", provider="openai"):
     low = value.lower()
     provider = str(provider or "").strip().lower()
     if provider == "codex":
-        if not value or low.startswith("$imagegen") or low.startswith("gpt-image"):
-            return "gpt-5.4"
-        return value
+        return codex_image_host_model(value)
     if not value or low.startswith("$imagegen"):
         return "gpt-image-2"
     return value
@@ -5097,18 +5401,15 @@ def gpt_image_2_skill_size_arg(size="", model="", prompt="", provider="openai"):
     text = " ".join([str(size or ""), str(model or ""), str(prompt or "")]).lower()
     size_text = str(size or "").strip()
     if str(provider or "").strip().lower() == "codex":
-        if "1k" in text or "1024" in text:
-            return "1K"
-        if "2k" in text or "2048" in text:
-            return "2K"
-        if "4k" in text or "3840" in text:
-            return "4K"
         width, height = parse_size_pair(size_text)
         if 0 < max(width, height) < 1800:
-            return "1K"
-        if 1800 <= max(width, height) < 3000:
-            return "2K"
-        return "4K"
+            return f"{width}x{height}"
+        # 2026-09-19 实测（T1.2 补充）：codex 通道服务端只稳定接受 1K 与精确 宽x高；
+        # auto/2K/4K 档位值会触发 missing_image_result。大尺寸请求转为精确像素
+        # （snap 到 16 的倍数），小请求收敛 1K（1254x1254 级输出）。
+        if width and height:
+            return f"{(width + 15) // 16 * 16}x{(height + 15) // 16 * 16}"
+        return "1K"
     match = re.search(r"(\d{3,5})\s*[x×*]\s*(\d{3,5})", size_text, flags=re.I)
     if match:
         width = int(match.group(1))
@@ -5132,7 +5433,9 @@ def gpt_image_2_skill_size_arg(size="", model="", prompt="", provider="openai"):
     return "2K"
 
 def gpt_image_2_skill_prompt_arg(prompt="", size="", provider="openai"):
-    prompt_text = str(prompt or "").strip()
+    # gpt-image-2-skill 经 .cmd 垫片启动：cmd.exe 会在换行处重新切分参数，导致
+    # --out 等后续参数丢失（实测 2026-09-19）。prompt 必须折叠为单行。
+    prompt_text = re.sub(r"\s*\r?\n\s*", " ", str(prompt or "")).strip()
     if str(provider or "").strip().lower() != "codex":
         return prompt_text
     size_arg = gpt_image_2_skill_size_arg(size, "", prompt, provider)
@@ -5279,18 +5582,135 @@ def codex_postprocess_image_to_requested_size(path="", requested_size="", provid
         print(f"{label} 图片尺寸后处理失败：{exc}")
         return ""
 
-async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths=None):
+async def generate_codex_image_via_request_create(prompt, size, model, exe, tool_model):
+    """实验性 2.5 档位：request create 注入 tools[].model（仅文生图，Codex 通道）。"""
+    host_model = codex_image_host_model(model)
+    if not host_model:
+        raise HTTPException(status_code=400, detail="未能解析可用的 Codex 宿主模型。请设置 CODEX_IMAGE_HOST_MODEL / CODEX_MODEL，或在 ~/.codex/config.toml 配置 model。")
+    prompt_text = gpt_image_2_skill_prompt_arg(prompt, size, "codex")
+    size_arg = gpt_image_2_skill_size_arg(size, "", prompt, "codex")
+    body = codex_image_request_body(prompt_text, host_model, tool_model, size_arg)
+    fd, body_path = tempfile.mkstemp(prefix="codex_image_body_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(body, f, ensure_ascii=False)
+    out_path = os.path.join(OUTPUT_OUTPUT_DIR, f"gpt_image_2_{uuid.uuid4().hex}.png")
+    args = [
+        exe,
+        "--json",
+        "--json-events",
+        "--provider",
+        "codex",
+        "request",
+        "create",
+        "--request-operation",
+        "responses",
+        "--body-file",
+        body_path,
+        "--out-image",
+        out_path,
+        "--expect-image",
+    ]
+    auth_file = gpt_image_2_skill_auth_file()
+    if auth_file and os.path.isfile(auth_file):
+        args.extend(["--auth-file", auth_file])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=codex_timeout())
+    except asyncio.TimeoutError as exc:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise HTTPException(status_code=504, detail="GPT Image 2 Skill（request create）执行超时。可设置 CODEX_CLI_TIMEOUT 增大等待时间。") from exc
+    except FileNotFoundError:
+        return None
+    finally:
+        try:
+            os.remove(body_path)
+        except Exception:
+            pass
+    out_text, err_text = codex_decode_output(stdout, stderr)
+    observed_models = parse_codex_observed_image_model(err_text) or parse_codex_observed_image_model(out_text)
+    observed = observed_models[0] if observed_models else ""
+    if proc.returncode != 0:
+        message = gpt_image_2_skill_failure_message(out_text, err_text, proc.returncode)
+        auth_failed = bool(re.search(r"\b401\b|unauthori[sz]ed|access[_ -]?token", message, re.I))
+        if auth_failed:
+            detail = "Codex 登录凭据无效或已过期，请重新运行 codex 登录后重试。"
+            if message:
+                detail += f" 服务端消息：{message[:800]}"
+            raise HTTPException(status_code=401, detail=detail)
+        raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 调用失败：{message[:1200]}")
+    parsed, reported_paths = parse_gpt_image_2_skill_output(out_text, err_text)
+    candidate_paths = []
+    if os.path.isfile(out_path):
+        candidate_paths.append(out_path)
+    candidate_paths.extend([path for path in reported_paths if path and os.path.isfile(path)])
+    if not candidate_paths:
+        status_text = (out_text or err_text or "")[:1200]
+        raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 已返回，但没有在输出目录发现图片：{status_text}")
+    image_size = codex_image_dimensions(candidate_paths[0])
+    urls = []
+    for path in candidate_paths:
+        processed_path = codex_postprocess_image_to_requested_size(path, size, "codex")
+        url = codex_output_url_from_path(processed_path or path)
+        if url:
+            urls.append(url)
+    if not urls:
+        status_text = (out_text or err_text or "")[:1200]
+        raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 已返回，但没有在输出目录发现图片：{status_text}")
+    confirmed = bool(observed and observed.strip().lower() == str(tool_model).strip().lower())
+    return {"type": "url", "value": urls[0]}, {
+        "images": urls,
+        "text": out_text,
+        "provider": "codex",
+        "tool": "gpt-image-2-skill",
+        "tool_provider": "codex",
+        "host_model": host_model,
+        "image_model_requested": tool_model,
+        "image_model_observed": observed,
+        "image_model_confirmed": confirmed,
+        "image_size": image_size,
+        "raw": parsed or {"stdout": out_text, "stderr": err_text},
+    }
+
+def codex_image_skill_attempts(provider=None, auth_file=""):
+    """构造 images generate 的尝试序列（auto/latest 档）。
+
+    Codex 订阅通道优先；仅当 provider 开关 allow_api_fallback 打开且能找到 API key 时，
+    追加 OpenAI API 通道回退（Codex 401 时启用，出图按 API 计费）。默认不回退。
+    实验性 2.5 档（request create 路径）不经过本函数，严格只走订阅额度。
+    """
+    auth_data = gpt_image_2_skill_auth_json(auth_file)
+    provider_args, tool_provider = gpt_image_2_skill_provider_args(auth_file)
+    attempts = [(provider_args, tool_provider)]
+    fallback_enabled = bool(
+        provider
+        and (provider.get("allow_api_fallback") or provider.get("codex_allow_api_fallback"))
+    )
+    fallback_api_key = gpt_image_2_skill_api_key(auth_data)
+    if tool_provider == "codex" and fallback_enabled and fallback_api_key:
+        attempts.append((["--provider", "openai", "--api-key", fallback_api_key], "openai"))
+    return attempts
+
+async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths=None, image_model="", provider=None):
     exe = gpt_image_2_skill_executable()
     if not exe:
         return None
     ref_paths = [str(path) for path in (ref_paths or []) if path and os.path.isfile(str(path))]
+    tool_model = codex_experimental_image_model(image_model)
+    if tool_model:
+        if ref_paths:
+            raise HTTPException(status_code=400, detail="实验性 Image 2.5 目前仅支持文生图（Codex 通道不支持参考图编辑）。请移除参考图，或改用 auto/latest 档位。")
+        return await generate_codex_image_via_request_create(prompt, size, model, exe, tool_model)
     auth_file = gpt_image_2_skill_auth_file()
-    auth_data = gpt_image_2_skill_auth_json(auth_file)
-    provider_args, tool_provider = gpt_image_2_skill_provider_args(auth_file)
-    attempts = [(provider_args, tool_provider)]
-    fallback_api_key = gpt_image_2_skill_api_key(auth_data)
-    if tool_provider == "codex" and fallback_api_key:
-        attempts.append((["--provider", "openai", "--api-key", fallback_api_key], "openai"))
+    attempts = codex_image_skill_attempts(provider, auth_file)
     last_message = ""
     for attempt_index, (attempt_provider_args, attempt_provider) in enumerate(attempts):
         out_path = os.path.join(OUTPUT_OUTPUT_DIR, f"gpt_image_2_{uuid.uuid4().hex}.png")
@@ -5344,8 +5764,11 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             auth_failed = bool(re.search(r"\b401\b|unauthori[sz]ed|access[_ -]?token|api[_ -]?key", message, re.I))
             if attempt_provider == "codex" and attempt_index + 1 < len(attempts) and auth_failed:
                 continue
-            if auth_failed:
-                return None
+            if attempt_provider == "codex" and auth_failed:
+                detail = "Codex 登录凭据无效或已过期，请重新运行 codex 登录后重试。"
+                if message:
+                    detail += f" 服务端消息：{message[:800]}"
+                raise HTTPException(status_code=401, detail=detail)
             raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 调用失败：{last_message[:1200]}")
         parsed, reported_paths = parse_gpt_image_2_skill_output(out_text, err_text)
         candidate_paths = []
@@ -5353,6 +5776,7 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             candidate_paths.append(out_path)
         candidate_paths.extend([path for path in reported_paths if path and os.path.isfile(path)])
         urls = []
+        image_size = codex_image_dimensions(candidate_paths[0]) if candidate_paths else None
         for path in candidate_paths:
             processed_path = codex_postprocess_image_to_requested_size(path, size, attempt_provider)
             url = codex_output_url_from_path(processed_path or path)
@@ -5367,6 +5791,10 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             "provider": "codex",
             "tool": "gpt-image-2-skill",
             "tool_provider": attempt_provider,
+            "image_model_requested": "auto/latest",
+            "image_model_observed": "",
+            "image_model_confirmed": False,
+            "image_size": image_size,
             "raw": parsed or {"stdout": out_text, "stderr": err_text},
         }
     raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 调用失败：{last_message[:1200]}")
@@ -5436,7 +5864,7 @@ async def codex_reference_paths(reference_images=None):
         raise
 
 def codex_models_payload(raw=None):
-    all_models = [*CODEX_DEFAULT_IMAGE_MODELS, *CODEX_DEFAULT_CHAT_MODELS]
+    all_models = [*CODEX_DEFAULT_IMAGE_MODELS, *CODEX_EXPERIMENTAL_IMAGE_MODELS, *CODEX_DEFAULT_CHAT_MODELS]
     return {
         "ok": True,
         "protocol": "codex",
@@ -5444,17 +5872,18 @@ def codex_models_payload(raw=None):
         "message": "OpenAI Codex CLI 可用，模型列表来自本机 CLI 默认配置。",
         "model_count": len(all_models),
         "total": len(all_models),
-        "image_models": CODEX_DEFAULT_IMAGE_MODELS,
+        "image_models": [*CODEX_DEFAULT_IMAGE_MODELS, *CODEX_EXPERIMENTAL_IMAGE_MODELS],
+        "experimental_image_models": CODEX_EXPERIMENTAL_IMAGE_MODELS,
         "chat_models": CODEX_DEFAULT_CHAT_MODELS,
         "video_models": [],
         "all": all_models,
         "raw": raw or {},
     }
 
-async def generate_codex_provider_image(prompt, size, model, reference_images=None, provider=None):
+async def generate_codex_provider_image(prompt, size, model, reference_images=None, provider=None, image_model=""):
     ref_paths, temp_paths = await codex_reference_paths(reference_images)
     try:
-        skill_result = await generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths)
+        skill_result = await generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, model, ref_paths, image_model, provider)
         if skill_result:
             return skill_result
         raise HTTPException(status_code=400, detail="未找到 GPT Image 2 helper，OpenAI CLI 生图已禁用 $imagegen 回退。请先安装 gpt-image-2-skill 后再生成图片。")
@@ -7609,8 +8038,7 @@ def _read_local_upload_classification(filename):
 
 def _write_local_upload_classification(filename, classification):
     path = _local_upload_classification_path(filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(normalize_asset_classification(classification), f, ensure_ascii=False, indent=2)
+    atomic_write_json(path, normalize_asset_classification(classification), indent=2)
 
 def asset_classification_prompt(extra_prompt=""):
     base = load_asset_classification_prompt()
@@ -7736,8 +8164,7 @@ def save_asset_library(lib):
     sort_asset_library_items(lib)
     lib["updated_at"] = now_ms()
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(ASSET_LIBRARY_PATH, "w", encoding="utf-8") as f:
-        json.dump(lib, f, ensure_ascii=False, indent=2)
+    atomic_write_json(ASSET_LIBRARY_PATH, lib, indent=2)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_asset_library_updated(int(lib["updated_at"])), GLOBAL_LOOP)
 
@@ -7797,8 +8224,7 @@ def shared_folders_load():
 
 def shared_folders_save(data):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(SHARED_FOLDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(SHARED_FOLDERS_FILE, data, indent=2)
 
 def shared_folder_by_id(folder_id):
     for entry in shared_folders_load().get("folders", []):
@@ -8067,8 +8493,7 @@ def save_prompt_libraries(data):
     data = normalize_prompt_libraries(data)
     data["updated_at"] = now_ms()
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PROMPT_LIBRARY_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(PROMPT_LIBRARY_PATH, data, indent=2)
     return data
 
 def public_prompt_libraries(data=None):
@@ -11169,14 +11594,14 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
-async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution=""):
+async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", image_model=""):
     provider = get_api_provider(provider_id)
     if is_tudou_provider(provider):
         model = tudou_image_model_for_request(model)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_codex_provider(provider):
-        return await generate_codex_provider_image(prompt, size, model, reference_images, provider)
+        return await generate_codex_provider_image(prompt, size, model, reference_images, provider, image_model)
     if is_gemini_cli_provider(provider):
         return await generate_gemini_cli_provider_image(prompt, size, model, reference_images, provider)
     if is_jimeng_provider(provider):
@@ -13291,8 +13716,36 @@ async def save_providers(payload: List[ApiProviderPayload]):
 
 # --- ModelScope Token (从 env 读取，不再支持通过 UI 修改) ---
 
+def _is_loopback_or_lan_host(host: str) -> bool:
+    """判断来源是否为本机或局域网地址。仅用于告警提示，不做拦截。
+
+    之所以只告警不拦截：本服务按工作室需求监听 0.0.0.0 供局域网共享，
+    局域网页面（如 zimage / angle）本来就需要访问本接口。
+    """
+    try:
+        addr = ipaddress.ip_address(str(host or "").strip())
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private
+
+
 @app.get("/api/config/token")
-async def get_global_token():
+async def get_global_token(request: Request):
+    """把已保存的 ModelScope Token 下发给同源的 zimage / angle 页面。
+
+    这两个页面需要把 Token 交给外部的 /generate 服务（由 ModelScope 侧提供，
+    不在本进程内），所以 Token 必须经过浏览器中转，无法改成后端代理而不改动
+    那条链路的架构。因此这里保留原行为，但记录访问来源，便于发现异常访问。
+
+    注意该响应不进入日志：access log 只记录路径不记录响应体，body 里也不要
+    加任何打印，否则等于把密钥写进日志。
+    """
+    client_host = request.client.host if request.client else ""
+    if not _is_loopback_or_lan_host(client_host):
+        logging.getLogger("uvicorn.access").warning(
+            "警告：/api/config/token 被非本机来源访问 (client=%s)", client_host
+        )
+
     # 优先读 env，回退到 global_config.json（兼容旧数据）
     saved_token = modelscope_api_key()
     if saved_token:
@@ -13972,11 +14425,24 @@ async def build_online_image_result(payload: OnlineImageRequest):
     provider = get_api_provider(payload.provider_id)
     default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
     model = selected_model(payload.model, default_model)
+    # 兼容归一化：旧客户端把 2.5 型号填在 model 字段时，自动改走 image_model 通道
+    image_model = str(payload.image_model or "").strip() or codex_experimental_image_model(model)
     request_size = snap_size_to_multiple(payload.size, 16)
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     operation = str(payload.operation or "").strip().lower()
+    # 业务校验（校审 P1-4）：提示词 / Skill / 参考图 至少其一；纯空请求拒绝
+    if not str(payload.prompt or "").strip() and not (payload.skill and str(payload.skill.id or "").strip()) and not refs:
+        raise HTTPException(status_code=400, detail="请提供提示词、连接 Skill 节点或参考图——三者至少其一")
+    # Skill 编译注入（PRD FR2-6/FR2-7）：所有 provider 共享此入口；无 skill 时请求与原流程完全一致。
+    # upscale（图片放大）不走提示词，跳过编译（审查 P2-5）。
+    skill_used = None
+    effective_prompt = payload.prompt
+    if payload.skill and str(payload.skill.id or "").strip() and operation != "upscale":
+        skill_result = await compile_skill_prompt(payload.skill, payload.prompt)
+        effective_prompt = skill_result["compiled_prompt"]
+        skill_used = {**skill_result["skill_used"], "cached": skill_result["cached"]}
     if operation == "upscale":
         if not is_jimeng_provider(provider):
             raise HTTPException(status_code=400, detail="图片放大目前仅支持即梦（Dreamina）平台")
@@ -13988,8 +14454,8 @@ async def build_online_image_result(payload: OnlineImageRequest):
             image_data, raw_item = await generate_jimeng_upscale_image(image_refs, payload.resolution_type)
         else:
             image_data, raw_item = await generate_ai_image(
-                payload.prompt, request_size, payload.quality, model, image_refs, provider["id"],
-                payload.aspect_ratio, payload.resolution,
+                effective_prompt, request_size, payload.quality, model, image_refs, provider["id"],
+                payload.aspect_ratio, payload.resolution, image_model,
             )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
@@ -14036,6 +14502,14 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
+    # Codex 诚实反馈元数据透传（PRD FR1-5）：观察模型/确认标志等供前端溯源与提示
+    if isinstance(raw, dict):
+        for meta_key in ("image_model_requested", "image_model_observed", "image_model_confirmed", "image_size", "host_model", "tool_provider"):
+            if meta_key in raw and raw[meta_key] is not None:
+                result[meta_key] = raw[meta_key]
+    if skill_used:
+        result["skill_used"] = skill_used
+        result["compiled_prompt"] = effective_prompt
     save_to_history(result)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
@@ -16116,21 +16590,25 @@ async def delete_project(project_id: str):
     save_projects(projects)
     # 把该项目下的画布迁回默认项目
     moved = 0
-    with CANVAS_LOCK:
-        for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
-                continue
-            path = os.path.join(CANVAS_DIR, filename)
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            if str(data.get("project") or "") == project_id:
-                data["project"] = DEFAULT_PROJECT_ID
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+    for filename in os.listdir(CANVAS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        canvas_id = filename[:-len(".json")]
+        matched = []
+        def move(canvas, _pid=project_id):
+            if str(canvas.get("project") or "") != _pid:
+                return False
+            canvas["project"] = DEFAULT_PROJECT_ID
+            matched.append(True)
+
+        try:
+            mutate_canvas(canvas_id, move, allow_deleted=True, bump_updated_at=False)
+            if matched:
                 moved += 1
+        except HTTPException:
+            continue
+        except Exception:
+            continue
     return {"ok": True, "moved": moved}
 
 @app.get("/api/canvases/trash")
@@ -16155,27 +16633,27 @@ async def get_canvas_meta(canvas_id: str):
 @app.post("/api/canvases/{canvas_id}/meta")
 async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
     """更新画布的轻量元数据（标题/图标/负责人/颜色/置顶）。
-    刻意不走 save_canvas（它会刷新 updated_at），以免打标签/置顶把画布顶到列表最前。"""
-    canvas = load_canvas(canvas_id)
-    if payload.title is not None:
-        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
-    if payload.icon is not None:
-        canvas["icon"] = (payload.icon or "layers")[:32]
-    if payload.owner is not None:
-        canvas["owner"] = str(payload.owner).strip()[:40]
-    if payload.color is not None:
-        canvas["color"] = normalize_canvas_color(payload.color)
-    if payload.pinned is not None:
-        canvas["pinned"] = bool(payload.pinned)
-    if payload.project is not None:
-        canvas["project"] = str(payload.project).strip() or DEFAULT_PROJECT_ID
-    if payload.board_x is not None:
-        canvas["board_x"] = float(payload.board_x)
-    if payload.board_y is not None:
-        canvas["board_y"] = float(payload.board_y)
-    with CANVAS_LOCK:
-        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
-            json.dump(canvas, f, ensure_ascii=False, indent=2)
+    刻意不刷新 updated_at（bump_updated_at=False），以免打标签/置顶把画布顶到列表最前。"""
+
+    def apply(canvas):
+        if payload.title is not None:
+            canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+        if payload.icon is not None:
+            canvas["icon"] = (payload.icon or "layers")[:32]
+        if payload.owner is not None:
+            canvas["owner"] = str(payload.owner).strip()[:40]
+        if payload.color is not None:
+            canvas["color"] = normalize_canvas_color(payload.color)
+        if payload.pinned is not None:
+            canvas["pinned"] = bool(payload.pinned)
+        if payload.project is not None:
+            canvas["project"] = str(payload.project).strip() or DEFAULT_PROJECT_ID
+        if payload.board_x is not None:
+            canvas["board_x"] = float(payload.board_x)
+        if payload.board_y is not None:
+            canvas["board_y"] = float(payload.board_y)
+
+    canvas = mutate_canvas(canvas_id, apply, bump_updated_at=False)
     return {"canvas": canvas_record(canvas)}
 
 @app.get("/api/canvases/{canvas_id}")
@@ -16184,8 +16662,7 @@ async def get_canvas(canvas_id: str):
 
 @app.post("/api/canvases/{canvas_id}/touch")
 async def touch_canvas(canvas_id: str):
-    canvas = load_canvas(canvas_id)
-    save_canvas(canvas)
+    canvas = mutate_canvas(canvas_id, lambda c: None)
     return {"canvas": canvas_record(canvas), "updated_at": canvas.get("updated_at", 0)}
 
 @app.get("/api/canvas-assets")
@@ -17286,43 +17763,51 @@ async def batch_crop_asset_library_items(payload: AssetLibraryBatchCropRequest):
 
 @app.put("/api/canvases/{canvas_id}")
 async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
-    canvas = load_canvas(canvas_id)
-    current_updated_at = int(canvas.get("updated_at") or 0)
-    if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
-        raise HTTPException(status_code=409, detail={
-            "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
-            "canvas": canvas,
-            "updated_at": current_updated_at,
-        })
-    canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
-    canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
-    canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
-    canvas["nodes"] = payload.nodes
-    canvas["connections"] = payload.connections
-    if canvas["kind"] == "smart":
-        canvas["viewport"] = payload.viewport
-    else:
-        canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
-    canvas["logs"] = payload.logs[-500:]
-    canvas["settings"] = payload.settings or {}
-    save_canvas(canvas)
+    def apply(canvas):
+        # 乐观并发检查必须在锁内做。放在锁外会出现 TOCTOU：读到 updated_at 之后、
+        # 真正写入之前，另一个请求已经保存过，于是本次比较基于过期的值通过，
+        # 静默覆盖掉那次保存。锁内比较才能保证检查与写入之间没有窗口。
+        current_updated_at = int(canvas.get("updated_at") or 0)
+        if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
+            raise HTTPException(status_code=409, detail={
+                "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
+                "canvas": canvas,
+                "updated_at": current_updated_at,
+            })
+        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+        canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
+        canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
+        canvas["nodes"] = payload.nodes
+        canvas["connections"] = payload.connections
+        if canvas["kind"] == "smart":
+            canvas["viewport"] = payload.viewport
+        else:
+            canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
+        canvas["logs"] = payload.logs[-500:]
+        canvas["settings"] = payload.settings or {}
+
+    canvas = mutate_canvas(canvas_id, apply)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), payload.client_id)
     return {"canvas": canvas}
 
 @app.delete("/api/canvases/{canvas_id}")
 async def delete_canvas(canvas_id: str):
-    canvas = load_canvas_any(canvas_id)
-    if not canvas.get("deleted_at"):
+    def apply(canvas):
+        if canvas.get("deleted_at"):
+            return False
         canvas["deleted_at"] = now_ms()
-        save_canvas(canvas)
+
+    mutate_canvas(canvas_id, apply, allow_deleted=True)
     return {"ok": True}
 
 @app.post("/api/canvases/{canvas_id}/restore")
 async def restore_canvas(canvas_id: str):
-    canvas = load_canvas_any(canvas_id)
-    if canvas.get("deleted_at"):
+    def apply(canvas):
+        if not canvas.get("deleted_at"):
+            return False
         canvas.pop("deleted_at", None)
-        save_canvas(canvas)
+
+    canvas = mutate_canvas(canvas_id, apply, allow_deleted=True)
     return {"canvas": canvas}
 
 @app.delete("/api/canvases/{canvas_id}/purge")
@@ -17772,8 +18257,9 @@ async def delete_history(req: DeleteHistoryRequest):
                 else:
                     new_history.append(item)
             if target_record:
-                with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(new_history, f, ensure_ascii=False, indent=4)
+                # 已在上面的 HISTORY_LOCK 内，这里不能再加锁：Lock 不可重入，
+                # 嵌套获取会直接把请求线程挂死。
+                atomic_write_json(HISTORY_FILE, new_history, indent=4)
 
         if target_record:
             for img_url in target_record.get("images", []):
@@ -18445,8 +18931,7 @@ def load_runninghub_workflow_store():
 
 def save_runninghub_workflow_store(store):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(RUNNINGHUB_WORKFLOW_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
+    atomic_write_json(RUNNINGHUB_WORKFLOW_STORE_FILE, store, indent=2)
 
 def prune_runninghub_workflow_store_for_provider(provider):
     if not isinstance(provider, dict) or provider.get("id") != "runninghub":
@@ -18956,8 +19441,7 @@ def upload_workflow(payload: WorkflowUploadRequest):
     os.makedirs(custom_dir, exist_ok=True)
     stored_name = f"{CUSTOM_WORKFLOW_FOLDER}/{name}"
     path = workflow_path_from_name(stored_name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload.workflow, f, ensure_ascii=False, indent=2)
+    atomic_write_json(path, payload.workflow, indent=2)
     return {"name": stored_name}
 
 @app.put("/api/workflows/{name:path}/config")
@@ -18968,8 +19452,7 @@ def save_workflow_config(name: str, payload: WorkflowConfig):
     if not os.path.exists(workflow_path):
         raise HTTPException(status_code=404, detail="Workflow not found")
     cfg_path = workflow_config_path(name)
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(payload.dict(), f, ensure_ascii=False, indent=2)
+    atomic_write_json(cfg_path, payload.dict(), indent=2)
     return {"config": payload.dict()}
 
 @app.delete("/api/workflows/{name:path}")
@@ -19028,6 +19511,1097 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
         client_id=payload.client_id or str(uuid.uuid4()),
     )
     return generate(req)
+
+# --- 画布 Skill 库 ---
+
+# Skill 是给生图/改写流程读取的「指令文档包」（SKILL.md + references/assets），不是可执行程序。
+# 安全红线（PRD FR2-4）：第三方 skill 的 scripts/ 目录一律不执行；~/.codex/skills/ 只读引用。
+SKILL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+SKILL_META_FILE = ".skill_meta.json"
+SKILLS_CUSTOM_DIR = os.path.join(BASE_DIR, "skills", "custom")
+SKILLS_BUILTIN_DIR = os.path.join(BASE_DIR, "skills")
+SKILLS_MAX_FILE_BYTES = 20 * 1024 * 1024
+SKILLS_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+SKILLS_MAX_FILES = 500
+SKILLS_ZIP_MAX_BYTES = 20 * 1024 * 1024
+SKILLS_ZIP_STREAM_MAX_BYTES = 120 * 1024 * 1024
+# 导入时跳过的大文件阈值：示例图/大素材对提示词编译无影响（编译只读 SKILL.md 文本），
+# 跳过它们才能导入含大量示例图的超大 skill 仓库（如 mono-color-skill 72MB）。
+SKILLS_SKIP_FILE_BYTES = 2 * 1024 * 1024
+SKILLS_SCRIPT_EXTS = {".py", ".sh", ".js", ".mjs", ".cjs", ".cmd", ".bat", ".ps1", ".exe", ".dll"}
+SKILLS_MAX_SKILL_MD_BYTES = 1024 * 1024
+
+try:
+    import yaml as _skill_yaml
+except Exception:
+    _skill_yaml = None
+
+
+class SkillVariantItem(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    prompt: str = Field(default="", max_length=2000)
+    id: str = ""
+
+
+class SkillCreateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=64)
+    description: str = Field(default="", max_length=500)
+    content: str = Field(default="", max_length=200_000)
+    variants: List[SkillVariantItem] = []
+
+
+class SkillUpdateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=200_000)
+    variants: Optional[List[SkillVariantItem]] = None
+
+
+def normalize_skill_variant_items(items):
+    """表单变体 → frontmatter 结构（id 从 label 推导，去重）。"""
+    out = []
+    seen = set()
+    for item in items or []:
+        label = re.sub(r"[\r\n\t]+", " ", str(item.label or "").strip())[:80]
+        prompt = str(item.prompt or "").strip()[:2000]
+        if not label:
+            continue
+        vid = normalize_skill_id(str(item.id or "") or label) or normalize_skill_id(label)
+        if not vid or vid in seen:
+            vid = f"{vid or 'variant'}-{len(out) + 1}"
+        seen.add(vid)
+        out.append({"id": vid, "label": label, "prompt": prompt})
+    return out
+
+
+def rewrite_skill_frontmatter(dir_path, updates):
+    """局部重写 SKILL.md frontmatter 的指定字段（保留其余字段与正文）。"""
+    md_path = os.path.join(dir_path, "SKILL.md")
+    with open(md_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    match = re.match(r"^---[\t]*\r?\n(.*?)\r?\n---[\t]*\r?\n?", text, flags=re.S)
+    fm = {}
+    body = text
+    if match:
+        if _skill_yaml is not None:
+            try:
+                loaded = _skill_yaml.safe_load(match.group(1))
+                if isinstance(loaded, dict):
+                    fm = loaded
+            except Exception:
+                fm = {}
+        body = text[match.end():]
+    else:
+        body = text
+    fm.update(updates)
+    if _skill_yaml is None:
+        raise HTTPException(status_code=500, detail="缺少 yaml 库，无法写入样式样板")
+    new_text = "---\n" + _skill_yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, width=120) + "---\n" + body
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(new_text.replace("\r\n", "\n"))
+
+def normalize_skill_id(value):
+    text = re.sub(r"\s+", "-", str(value or "").strip().lower())
+    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
+    return text[:64]
+
+def skill_source_root(source):
+    if source == "custom":
+        return os.path.realpath(SKILLS_CUSTOM_DIR)
+    if source == "builtin":
+        return os.path.realpath(SKILLS_BUILTIN_DIR)
+    if source == "codex":
+        user_profile = str(os.getenv("USERPROFILE") or "").strip()
+        codex_home = str(os.getenv("CODEX_HOME") or "").strip()
+        base = codex_home or (os.path.join(user_profile, ".codex") if user_profile else os.path.expanduser("~/.codex"))
+        return os.path.realpath(os.path.join(base, "skills"))
+    return ""
+
+def skill_dir_for(source, skill_id):
+    """解析来源目录下的 skill 目录，realpath 校验防路径穿越。"""
+    root = skill_source_root(source)
+    if not root:
+        raise HTTPException(status_code=400, detail=f"未知的 Skill 来源：{source}")
+    safe_id = str(skill_id or "").strip()
+    if "\0" in safe_id or ":" in safe_id or ".." in safe_id.replace("\\", "/").split("/") or safe_id.startswith("."):
+        raise HTTPException(status_code=400, detail="Skill 路径不合法")
+    if source == "custom" and not SKILL_ID_RE.match(safe_id):
+        raise HTTPException(status_code=400, detail=f"Skill ID 不合法：{safe_id[:60]}")
+    target = os.path.realpath(os.path.join(root, safe_id))
+    try:
+        inside = os.path.commonpath([root, target]) == root
+    except ValueError:
+        inside = False
+    if not inside or os.path.basename(target) != safe_id:
+        raise HTTPException(status_code=400, detail="Skill 路径不合法")
+    if not os.path.isdir(target):
+        raise HTTPException(status_code=404, detail=f"Skill 不存在：{source}/{safe_id}")
+    return target
+
+def _guarded_yaml_load(text, alias_limit=1000):
+    """带复杂度上限的 yaml 解析：防第三方 SKILL.md frontmatter 的 alias 炸弹 DoS。"""
+    if _skill_yaml is None:
+        return None
+    counter = {"nodes": 0}
+
+    class GuardedLoader(_skill_yaml.SafeLoader):
+        def compose_node(self, parent, index):
+            counter["nodes"] += 1
+            if counter["nodes"] > alias_limit:
+                raise _skill_yaml.YAMLError("yaml complexity limit exceeded")
+            return super().compose_node(parent, index)
+
+    try:
+        return _skill_yaml.load(text, Loader=GuardedLoader)
+    except Exception:
+        return None
+
+def parse_skill_markdown_text(text):
+    """解析 SKILL.md：YAML frontmatter + 正文。yaml 缺失/超限/畸形时回退 flat key: value 解析。"""
+    text = str(text or "").lstrip("\ufeff")
+    match = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", text, flags=re.S)
+    if not match:
+        return {}, text
+    fm_text, body = match.group(1), text[match.end():]
+    data = {}
+    loaded = _guarded_yaml_load(fm_text)
+    if isinstance(loaded, dict):
+        data = {str(key): value for key, value in loaded.items()}
+        return data, body
+    for raw in fm_text.splitlines():
+        m = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", raw.strip())
+        if m:
+            data[m.group(1)] = m.group(2).strip().strip("\"'")
+    return data, body
+
+def skill_read_meta(dir_path):
+    meta_path = os.path.join(dir_path, SKILL_META_FILE)
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def skill_write_meta(dir_path, meta):
+    try:
+        atomic_write_json(os.path.join(dir_path, SKILL_META_FILE), meta, indent=2)
+        return True
+    except Exception:
+        return False
+
+def skill_entry_from_dir(dir_path, source, readonly=False, include_body=False):
+    """扫描一个 skill 目录并组装元数据条目；缺少 SKILL.md 时也返回（标记 has_skill_md=False 供前端提示）。"""
+    dir_path = os.path.realpath(dir_path)
+    skill_id = os.path.basename(dir_path)
+    skill_md = os.path.join(dir_path, "SKILL.md")
+    has_skill_md = os.path.isfile(skill_md)
+    name, description, version, license = skill_id, "", "", ""
+    skill_variants = []
+    extra_metadata = {}
+    body = ""
+    if has_skill_md:
+        try:
+            with open(skill_md, "r", encoding="utf-8", errors="replace") as f:
+                fm, body = parse_skill_markdown_text(f.read())
+            name = str(fm.get("name") or skill_id)[:200]
+            description = str(fm.get("description") or "").strip()[:300]
+            version = str(fm.get("version") or "").strip()[:60]
+            license_text = fm.get("license") or fm.get("licenses")
+            license_text = "" if isinstance(license_text, (dict, list)) else str(license_text or "").strip()
+            license = license_text[:120]
+            # 样式变体（frontmatter variants: [{id,label,prompt}]）：节点二级下拉的数据源
+            skill_variants = []
+            raw_variants = fm.get("variants")
+            if isinstance(raw_variants, list):
+                seen_ids = set()
+                for item in raw_variants:
+                    if not isinstance(item, dict):
+                        continue
+                    vid = normalize_skill_id(str(item.get("id") or item.get("label") or ""))[:60]
+                    label = str(item.get("label") or vid).strip()[:80]
+                    vprompt = str(item.get("prompt") or "").strip()[:2000]
+                    if not vid or vid in seen_ids:
+                        continue
+                    seen_ids.add(vid)
+                    skill_variants.append({"id": vid, "label": label, "prompt": vprompt})
+            allowed_meta = {"name", "description", "version", "license", "licenses", "variants"}
+            extra_metadata = {str(k): (v if isinstance(v, (str, int, float, bool)) else json.dumps(v, ensure_ascii=False)[:400]) for k, v in fm.items() if str(k) not in allowed_meta}
+        except Exception:
+            body = ""
+    files = 0
+    total_bytes = 0
+    has_scripts = False
+    script_files = []
+    references = 0
+    assets = 0
+    updated_at = 0
+    truncated = False
+    for root, dirs, names in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in names:
+            if fname.startswith(".") or fname == SKILL_META_FILE:
+                continue
+            files += 1
+            if files > SKILLS_MAX_FILES:
+                truncated = True
+                break
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, dir_path).replace("\\", "/")
+            try:
+                total_bytes += os.path.getsize(fpath)
+                updated_at = max(updated_at, int(os.path.getmtime(fpath) * 1000))
+            except OSError:
+                pass
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SKILLS_SCRIPT_EXTS:
+                has_scripts = True
+                if len(script_files) < 8:
+                    script_files.append(rel)
+            if rel.startswith("references/"):
+                references += 1
+            elif rel.startswith("assets/"):
+                assets += 1
+        if truncated:
+            break
+    warnings = []
+    if not has_skill_md:
+        warnings.append("缺少 SKILL.md，无法作为生图 Skill 使用")
+    if has_scripts:
+        warnings.append("包含脚本文件（仅列出，永不在本项目中执行）")
+    if truncated or total_bytes > SKILLS_MAX_TOTAL_BYTES:
+        warnings.append("超出大小/文件数限制，统计不完整")
+    meta = skill_read_meta(dir_path) if source == "custom" else {}
+    entry = {
+        "id": skill_id,
+        "name": name,
+        "description": description,
+        "version": version,
+        "license": license,
+        "source": source,
+        "readonly": readonly,
+        "has_skill_md": has_skill_md,
+        "has_scripts": has_scripts,
+        "script_files": script_files,
+        "references_count": references,
+        "assets_count": assets,
+        "files": files,
+        "total_bytes": total_bytes,
+        "updated_at": updated_at,
+        "warnings": warnings,
+        "metadata": extra_metadata,
+        "variants": skill_variants,
+        "summary": re.sub(r"\s+", " ", body).strip()[:200],
+    }
+    if source == "custom":
+        entry["install"] = {
+            "source": str(meta.get("source") or "local"),
+            "repo_url": str(meta.get("repo_url") or ""),
+            "commit_sha": str(meta.get("commit_sha") or ""),
+            "installed_at": int(meta.get("installed_at") or 0),
+        }
+    if include_body:
+        entry["body"] = body[:200_000]
+        entry["metadata"] = extra_metadata
+    return entry
+
+def skill_scan_all(include_body=False):
+    skills = []
+    seen_keys = set()
+    for source, readonly in (("custom", False), ("builtin", True), ("codex", True)):
+        root = skill_source_root(source)
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            dir_path = os.path.join(root, name)
+            if source == "builtin" and name == "custom":
+                continue
+            if not os.path.isdir(dir_path) or name.startswith("."):
+                continue
+            entry = skill_entry_from_dir(dir_path, source, readonly=readonly, include_body=include_body)
+            key = (source, entry["id"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            skills.append(entry)
+    return skills
+
+@app.get("/api/skills")
+async def api_skills_list():
+    return {"skills": skill_scan_all(include_body=False)}
+
+@app.get("/api/skills/{source}/{skill_id}")
+async def api_skill_detail(source: str, skill_id: str):
+    dir_path = skill_dir_for(source, skill_id)
+    entry = skill_entry_from_dir(dir_path, source, readonly=(source != "custom"), include_body=True)
+    rel_files = []
+    for root, dirs, names in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in names:
+            if fname.startswith(".") or fname == SKILL_META_FILE:
+                continue
+            rel_files.append(os.path.relpath(os.path.join(root, fname), dir_path).replace("\\", "/"))
+    entry["file_list"] = sorted(rel_files)[:SKILLS_MAX_FILES]
+    return entry
+
+@app.post("/api/skills/custom")
+async def api_skill_create(payload: SkillCreateRequest):
+    skill_id = normalize_skill_id(payload.name)
+    if not SKILL_ID_RE.match(skill_id):
+        raise HTTPException(status_code=400, detail="Skill 名称只能包含小写字母/数字/._-，且以字母或数字开头")
+    target = os.path.join(skill_source_root("custom"), skill_id)
+    if os.path.exists(target):
+        raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}")
+    def _clean(value):
+        return re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    name_clean = _clean(payload.name)[:100]
+    desc_clean = _clean(payload.description)[:400]
+    skill_variants = normalize_skill_variant_items(payload.variants)
+    fm_data = {"name": name_clean, "description": desc_clean, "version": "0.1.0"}
+    if skill_variants:
+        fm_data["variants"] = skill_variants
+    if _skill_yaml is not None:
+        fm_body = _skill_yaml.safe_dump(fm_data, allow_unicode=True, sort_keys=False)
+    else:
+        esc = lambda v: v.replace("\\", "\\\\").replace('"', '\\"')
+        fm_body = f'name: "{esc(name_clean)}"\ndescription: "{esc(desc_clean)}"\nversion: "0.1.0"\n'
+    try:
+        os.makedirs(target, exist_ok=True)
+        content = f"---\n{fm_body}---\n\n" + (payload.content.strip() + "\n" if payload.content.strip() else "# 在此编写该风格的使用指令（供生图改写流程读取）\n")
+        with open(os.path.join(target, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(content)
+        skill_write_meta(target, {"source": "local", "installed_at": now_ms(), "updated_at": now_ms()})
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"创建 Skill 失败：{exc}") from exc
+    return {"ok": True, "id": skill_id}
+
+@app.put("/api/skills/custom/{skill_id}")
+async def api_skill_update(skill_id: str, payload: SkillUpdateRequest):
+    dir_path = skill_dir_for("custom", skill_id)
+    skill_md = os.path.join(dir_path, "SKILL.md")
+    if not os.path.isfile(skill_md):
+        raise HTTPException(status_code=400, detail="该目录缺少 SKILL.md，不能作为 Skill 编辑")
+    try:
+        with open(skill_md, "w", encoding="utf-8") as f:
+            f.write(payload.content.replace("\r\n", "\n"))
+        if payload.variants is not None:
+            rewrite_skill_frontmatter(dir_path, {"variants": normalize_skill_variant_items(payload.variants)})
+        meta = skill_read_meta(dir_path)
+        meta["updated_at"] = now_ms()
+        skill_write_meta(dir_path, meta)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"保存 Skill 失败：{exc}") from exc
+    return {"ok": True}
+
+@app.delete("/api/skills/custom/{skill_id}")
+async def api_skill_delete(skill_id: str):
+    dir_path = skill_dir_for("custom", skill_id)
+    try:
+        shutil.rmtree(dir_path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"删除 Skill 失败：{exc}") from exc
+    return {"ok": True}
+
+class SkillGithubPreviewRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+    ref: str = Field(default="", max_length=200)
+    subdir: str = Field(default="", max_length=300)
+
+class SkillGithubInstallRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+    sha: str = Field(min_length=7, max_length=64)
+    name: str = Field(default="", max_length=64)
+    overwrite: bool = False
+    subdir: str = Field(default="", max_length=300)
+
+class SkillUpgradeRequest(BaseModel):
+    sha: str = Field(default="", max_length=64)
+
+def github_repo_slug(url):
+    """从 GitHub URL 提取 (owner, repo, ref)。支持 /tree/{ref} 与 .git 后缀。"""
+    text = str(url or "").strip()
+    match = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/tree/([^/?#]+))?/?$", text, flags=re.I)
+    if not match:
+        return "", "", ""
+    owner, repo, ref = match.group(1), match.group(2), (match.group(3) or "").strip()
+    return owner, repo, ref
+
+def github_api_headers():
+    headers = {"User-Agent": "Infinite-Canvas-Skill-Importer", "Accept": "application/vnd.github+json"}
+    token = str(os.getenv("GITHUB_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+async def github_resolve_commit(url, ref=""):
+    """只调 commits API 解析可执行的完整 SHA（check-update 用，避免白拉整个 zipball）。"""
+    owner, repo, ref_from_url = github_repo_slug(url)
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="URL 需要是 https://github.com/{owner}/{repo} 形式的仓库地址")
+    branch = str(ref or "").strip() or ref_from_url
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0), follow_redirects=True) as client:
+        try:
+            if not branch:
+                repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=github_api_headers())
+                repo_resp.raise_for_status()
+                branch = str((repo_resp.json() or {}).get("default_branch") or "main")
+            commit_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}", headers=github_api_headers())
+            commit_resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            detail = "GitHub 仓库不存在或不可访问" if status == 404 else ("GitHub API 限流，稍后再试或配置 GITHUB_TOKEN" if status in (403, 429) else f"GitHub 请求失败：HTTP {status}")
+            raise HTTPException(status_code=502, detail=detail) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"GitHub 网络请求失败：{exc}") from exc
+        data = commit_resp.json() or {}
+        sha = str(data.get("sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+            raise HTTPException(status_code=502, detail=f"GitHub 返回的提交 SHA 异常：{sha[:60]}")
+        message_lines = str((data.get("commit") or {}).get("message") or "").splitlines() or [""]
+        return {"owner": owner, "repo": repo, "ref": branch, "sha": sha, "commit_message": message_lines[0][:200]}
+
+async def github_download_repo_zip(url, sha_or_ref=""):
+    """解析提交并流式下载 zipball（边下边限长），返回 (temp_zip_path, info)。"""
+    owner, repo, ref_from_url = github_repo_slug(url)
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="URL 需要是 https://github.com/{owner}/{repo} 形式的仓库地址")
+    branch = str(sha_or_ref or "").strip() or ref_from_url
+    if branch and re.fullmatch(r"[0-9a-fA-F]{7,64}", branch):
+        branch = branch.lower()
+    info = await github_resolve_commit(url, branch)
+    fd, temp_zip = tempfile.mkstemp(prefix="skill_repo_", suffix=".zip")
+    downloaded = 0
+    over_limit = False
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0), follow_redirects=True) as client:
+            try:
+                async with client.stream("GET", f"https://api.github.com/repos/{owner}/{repo}/zipball/{info['sha']}", headers=github_api_headers()) as zip_resp:
+                    zip_resp.raise_for_status()
+                    with os.fdopen(fd, "wb") as f:
+                        fd = None
+                        async for chunk in zip_resp.aiter_bytes(1 << 16):
+                            downloaded += len(chunk)
+                            if downloaded > SKILLS_ZIP_STREAM_MAX_BYTES:
+                                over_limit = True
+                                break
+                            f.write(chunk)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                detail = "GitHub 仓库不存在或不可访问" if status == 404 else ("GitHub API 限流，稍后再试或配置 GITHUB_TOKEN" if status in (403, 429) else f"GitHub 请求失败：HTTP {status}")
+                raise HTTPException(status_code=502, detail=detail) from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail=f"GitHub 网络请求失败：{exc}") from exc
+        if over_limit:
+            raise HTTPException(status_code=400, detail=f"仓库压缩包超过 {SKILLS_ZIP_STREAM_MAX_BYTES // (1024*1024)}MB 上限")
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if over_limit:
+            try:
+                os.remove(temp_zip)
+            except OSError:
+                pass
+    return temp_zip, info
+
+def safe_extract_skill_zip(zip_path, dest_root):
+    """解压 zip 到 dest_root，带 zip-slip/大小/数量防护与大文件跳过。
+
+    返回 (解压根目录, skipped)；超过 SKILLS_SKIP_FILE_BYTES 的非 SKILL.md 文件跳过不写盘
+    （示例图/大素材对提示词编译无影响——编译只读 SKILL.md 文本），skipped 由调用方汇总进 warnings。
+    """
+    total_bytes = 0
+    file_count = 0
+    skipped = []
+    skipped_bytes = 0
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            names = archive.namelist()
+            if not names:
+                raise HTTPException(status_code=400, detail="压缩包为空")
+            top_prefix = names[0].split("/")[0] + "/"
+
+            def rel_path_of(info):
+                rel = info.filename
+                if rel.startswith(top_prefix):
+                    rel = rel[len(top_prefix):]
+                return rel
+
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                rel = rel_path_of(info)
+                if not rel or rel.startswith("/") or ".." in rel.replace("\\", "/").split("/") or ":" in rel:
+                    raise HTTPException(status_code=400, detail=f"压缩包含非法路径：{info.filename[:80]}")
+                file_count += 1
+                if info.file_size > SKILLS_MAX_FILE_BYTES:
+                    raise HTTPException(status_code=400, detail=f"压缩包内单文件超过 {SKILLS_MAX_FILE_BYTES // (1024*1024)}MB 上限：{info.filename[:80]}")
+                if file_count > SKILLS_MAX_FILES:
+                    raise HTTPException(status_code=400, detail=f"文件数超过 {SKILLS_MAX_FILES} 上限")
+                if info.file_size > SKILLS_SKIP_FILE_BYTES and not rel.upper().endswith("SKILL.MD"):
+                    skipped.append((rel, info.file_size))
+                    skipped_bytes += info.file_size
+                else:
+                    total_bytes += info.file_size
+                    if total_bytes > SKILLS_MAX_TOTAL_BYTES:
+                        raise HTTPException(status_code=400, detail=f"解压后超过 {SKILLS_MAX_TOTAL_BYTES // (1024*1024)}MB 上限")
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                rel = rel_path_of(info)
+                if info.file_size > SKILLS_SKIP_FILE_BYTES and not rel.upper().endswith("SKILL.MD"):
+                    continue
+                archive.extract(info, dest_root)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="压缩包格式无效") from exc
+    entries = [name for name in os.listdir(dest_root) if not name.startswith(".")]
+    if len(entries) != 1 or not os.path.isdir(os.path.join(dest_root, entries[0])):
+        raise HTTPException(status_code=400, detail="压缩包结构异常（应只有一个顶层目录）")
+    root = os.path.join(dest_root, entries[0])
+    skipped_info = None
+    if skipped:
+        skipped.sort(key=lambda item: -item[1])
+        summary = "、".join(f"{os.path.basename(name)}({size // 1024}KB)" for name, size in skipped[:4])
+        more = f" 等{len(skipped)}个" if len(skipped) > 4 else ""
+        skipped_info = {"count": len(skipped), "total_bytes": skipped_bytes, "summary": summary + more}
+        try:
+            with open(os.path.join(root, ".skipped-large-files.json"), "w", encoding="utf-8") as f:
+                json.dump({"skipped": skipped, "total_bytes": skipped_bytes}, f, ensure_ascii=False)
+        except OSError:
+            pass
+    return root, skipped_info
+
+def locate_skill_root(extracted_root, subdir=""):
+    """定位 SKILL.md：优先仓库根；可显式指定子目录（monorepo 多 skill）；否则要求恰好一个含 SKILL.md 的子目录。"""
+    wanted = str(subdir or "").strip().strip("/\\")
+    if wanted:
+        if ".." in wanted.replace("\\", "/").split("/") or ":" in wanted or os.path.isabs(wanted):
+            raise HTTPException(status_code=400, detail="子目录路径不合法")
+        candidate = os.path.realpath(os.path.join(extracted_root, wanted))
+        if os.path.commonpath([os.path.realpath(extracted_root), candidate]) != os.path.realpath(extracted_root):
+            raise HTTPException(status_code=400, detail="子目录路径不合法")
+        if not os.path.isfile(os.path.join(candidate, "SKILL.md")):
+            raise HTTPException(status_code=400, detail=f"子目录中未找到 SKILL.md：{wanted}")
+        return candidate, wanted.replace("\\", "/")
+    if os.path.isfile(os.path.join(extracted_root, "SKILL.md")):
+        return extracted_root, ""
+    candidates = []
+    for root, dirs, names in os.walk(extracted_root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if "SKILL.md" in names:
+            candidates.append(root)
+    if len(candidates) == 1:
+        found = candidates[0]
+        rel = os.path.relpath(found, extracted_root).replace("\\", "/")
+        return found, rel
+    if not candidates:
+        raise HTTPException(status_code=400, detail="仓库中未找到 SKILL.md（支持仓库根目录，或唯一包含 SKILL.md 的子目录）")
+    listing = "、".join(os.path.relpath(c, extracted_root).replace("\\", "/") for c in candidates[:5])
+    raise HTTPException(status_code=400, detail=f"仓库中有多个 SKILL.md（{listing}）。请通过 subdir 参数指定目标 Skill 所在的子目录后重试。")
+
+def swap_staged_into_target(staged, target, meta_writer=None):
+    """事务性覆盖安装（二次校审 P2：事务须覆盖元数据写入）。
+
+    流程：旧目录改名隐藏备份 → staged 移入 → meta_writer() 写元数据并验证 → 清理备份。
+    任一步失败：删除不完整新目录、恢复旧目录，异常向上抛出。
+    返回 (backup_left, replaced)。"""
+    backup = os.path.join(os.path.dirname(target), "." + os.path.basename(target) + ".install-bak")
+    if os.path.exists(backup):
+        shutil.rmtree(backup, ignore_errors=True)
+    replaced = os.path.exists(target)
+    if replaced:
+        os.rename(target, backup)
+    try:
+        shutil.move(staged, target)
+        if meta_writer is not None and not meta_writer():
+            raise OSError("skill meta write failed")
+    except Exception:
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            pass
+        if replaced and os.path.exists(backup):
+            os.rename(backup, target)
+        raise
+    backup_left = False
+    if replaced:
+        shutil.rmtree(backup, ignore_errors=True)
+        backup_left = os.path.exists(backup)
+    return backup_left, replaced
+
+def append_skip_warning(entry, skipped):
+    """把大文件跳过信息追加为 skill 条目的 warning（预览/zip 导入路径）。"""
+    if skipped and isinstance(entry, dict):
+        entry.setdefault("warnings", []).append(
+            f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译"
+        )
+
+def validate_and_stage_skill(skill_root, staged_root):
+    """校验 skill_root 并复制到 staged_root（临时暂存），返回 (entry, warnings)。"""
+    shutil.copytree(skill_root, staged_root, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git*", "__pycache__*"))
+    entry = skill_entry_from_dir(staged_root, "custom", include_body=False)
+    if not entry["has_skill_md"]:
+        raise HTTPException(status_code=400, detail="目标目录缺少 SKILL.md，不能作为 Skill 安装")
+    skill_md_size = os.path.getsize(os.path.join(staged_root, "SKILL.md"))
+    if skill_md_size > SKILLS_MAX_SKILL_MD_BYTES:
+        raise HTTPException(status_code=400, detail=f"SKILL.md 超过 {SKILLS_MAX_SKILL_MD_BYTES // 1024}KB 上限（当前 {skill_md_size // 1024}KB）")
+    return entry
+
+@app.post("/api/skills/github/preview")
+async def api_skill_github_preview(payload: SkillGithubPreviewRequest):
+    temp_zip, info = await github_download_repo_zip(payload.url, payload.ref)
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_preview_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            append_skip_warning(entry, skipped)
+            entry["id"] = (
+                normalize_skill_id(str(entry.get("name") or ""))
+                or normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
+                or entry["name"]
+            )
+            return {
+                "ok": True,
+                "repo": info,
+                "skill_root": skill_rel,
+                "skill": entry,
+                "confirm_required": True,
+            }
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+@app.post("/api/skills/github/install")
+async def api_skill_github_install(payload: SkillGithubInstallRequest):
+    if not re.fullmatch(r"[0-9a-f]{7,64}", str(payload.sha or "").lower()):
+        raise HTTPException(status_code=400, detail="SHA 格式不合法")
+    skill_id = normalize_skill_id(payload.name)
+    temp_zip, info = await github_download_repo_zip(payload.url, payload.sha)
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_install_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, skill_rel = locate_skill_root(extracted_root, payload.subdir)
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            append_skip_warning(entry, skipped)
+            if not skill_id:
+                # 优先 SKILL.md frontmatter name；zipball 顶层目录名（owner-repo-sha）只是兜底
+                skill_id = normalize_skill_id(str(entry.get("name") or "")) or normalize_skill_id(os.path.basename(skill_root.rstrip("/\\")))
+            if not SKILL_ID_RE.match(skill_id):
+                raise HTTPException(status_code=400, detail=f"从 SKILL.md/仓库名推导的 ID 不合法：{skill_id[:60]}，请手动指定名称")
+            target = os.path.join(skill_source_root("custom"), skill_id)
+            if os.path.exists(target) and not payload.overwrite:
+                raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
+            # 事务性覆盖（校审 P1-6/P2 + 二次校审）：元数据写入纳入事务，失败整体回滚
+            backup_left, replaced = swap_staged_into_target(staged, target, meta_writer=lambda: skill_write_meta(target, {
+                "source": "github",
+                "repo_url": f"https://github.com/{info['owner']}/{info['repo']}",
+                "commit_sha": info["sha"],
+                "ref": info["ref"],
+                "skill_root": skill_rel,
+                "installed_at": now_ms(),
+            }))
+            result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(target, "custom")}
+            warnings = []
+            if skipped:
+                warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
+            if replaced and backup_left:
+                warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.install-bak")
+            if warnings:
+                result["warnings"] = warnings
+            return result
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+@app.post("/api/skills/zip/install")
+async def api_skill_zip_install(file: UploadFile = File(...), overwrite: bool = Form(False)):
+    fd, temp_zip = tempfile.mkstemp(prefix="skill_zip_", suffix=".zip")
+    total_uploaded = 0
+    over_limit = False
+    with os.fdopen(fd, "wb") as f:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            total_uploaded += len(chunk)
+            if total_uploaded > SKILLS_ZIP_STREAM_MAX_BYTES:
+                over_limit = True
+                break
+            f.write(chunk)
+    if over_limit:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=f"压缩包超过 {SKILLS_ZIP_STREAM_MAX_BYTES // (1024*1024)}MB 上限")
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_zip_install_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, _rel = locate_skill_root(extracted_root)
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            append_skip_warning(entry, skipped)
+            skill_id = normalize_skill_id(entry.get("name") or os.path.basename(skill_root.rstrip("/\\")))
+            if not SKILL_ID_RE.match(skill_id):
+                raise HTTPException(status_code=400, detail=f"从 SKILL.md 推导的 ID 不合法：{skill_id[:60]}")
+            target = os.path.join(skill_source_root("custom"), skill_id)
+            if os.path.exists(target) and not overwrite:
+                raise HTTPException(status_code=409, detail=f"Skill 已存在：{skill_id}（可勾选覆盖安装）")
+            backup_left, replaced = swap_staged_into_target(staged, target, meta_writer=lambda: skill_write_meta(target, {"source": "zip", "installed_at": now_ms()}))
+            result = {"ok": True, "id": skill_id, "skill": skill_entry_from_dir(target, "custom")}
+            warnings = []
+            if replaced and backup_left:
+                warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.install-bak")
+            if warnings:
+                result["warnings"] = warnings
+            return result
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+@app.get("/api/skills/custom/{skill_id}/check-update")
+async def api_skill_check_update(skill_id: str):
+    dir_path = skill_dir_for("custom", skill_id)
+    meta = skill_read_meta(dir_path)
+    repo_url = str(meta.get("repo_url") or "")
+    if meta.get("source") != "github" or not repo_url:
+        raise HTTPException(status_code=400, detail="该 Skill 不是 GitHub 来源，无法检查更新")
+    current_sha = str(meta.get("commit_sha") or "")
+    info = await github_resolve_commit(repo_url, str(meta.get("ref") or ""))
+    latest_sha = info.get("sha") or ""
+    return {
+        "ok": True,
+        "current_sha": current_sha,
+        "latest_sha": latest_sha,
+        "up_to_date": bool(current_sha and current_sha.lower() == latest_sha.lower()),
+        "latest_commit_message": info.get("commit_message") or "",
+        "repo_url": repo_url,
+    }
+
+@app.post("/api/skills/custom/{skill_id}/upgrade")
+async def api_skill_upgrade(skill_id: str, payload: SkillUpgradeRequest):
+    dir_path = skill_dir_for("custom", skill_id)
+    meta = skill_read_meta(dir_path)
+    repo_url = str(meta.get("repo_url") or "")
+    if meta.get("source") != "github" or not repo_url:
+        raise HTTPException(status_code=400, detail="该 Skill 不是 GitHub 来源，无法升级")
+    temp_zip, info = await github_download_repo_zip(repo_url, str(payload.sha or meta.get("ref") or "").lower())
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill_upgrade_") as temp_dir:
+            extracted = os.path.join(temp_dir, "x")
+            os.makedirs(extracted)
+            extracted_root, skipped = safe_extract_skill_zip(temp_zip, extracted)
+            skill_root, skill_rel = locate_skill_root(extracted_root, str(meta.get("skill_root") or ""))
+            staged = os.path.join(temp_dir, "staged")
+            entry = validate_and_stage_skill(skill_root, staged)
+            # 备份目录用点前缀：skill_scan_all 跳过隐藏目录，不会出现幽灵条目；
+            # 也避免与用户合法 skill（ID 不能以点开头）撞名。
+            backup = os.path.join(skill_source_root("custom"), f".{skill_id}.upgrade-bak")
+            if os.path.exists(backup):
+                shutil.rmtree(backup, ignore_errors=True)
+            try:
+                os.rename(dir_path, backup)
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"升级失败：旧目录无法重命名（可能被其他程序占用）：{exc}") from exc
+            try:
+                shutil.move(staged, dir_path)
+                # 元数据写入纳入事务：失败则回滚到旧版本（二次校审 P2）
+                meta_written = skill_write_meta(dir_path, {
+                    **meta,
+                    "commit_sha": info["sha"],
+                    "ref": info["ref"],
+                    "skill_root": skill_rel,
+                    "updated_at": now_ms(),
+                })
+                if not meta_written:
+                    raise OSError("upgrade meta write failed")
+            except Exception:
+                try:
+                    if os.path.isdir(dir_path):
+                        shutil.rmtree(dir_path, ignore_errors=True)
+                except OSError:
+                    pass
+                if os.path.exists(backup):
+                    os.rename(backup, dir_path)
+                raise
+            backup_left = os.path.exists(backup)
+            if backup_left:
+                shutil.rmtree(backup, ignore_errors=True)
+                backup_left = os.path.exists(backup)
+            result = {"ok": True, "id": skill_id, "sha": info["sha"], "skill": skill_entry_from_dir(dir_path, "custom")}
+            warnings = []
+            if skipped:
+                warnings.append(f"已跳过{skipped['count']}个大文件（共{skipped['total_bytes'] // (1024*1024)}MB：{skipped['summary']}），不影响提示词编译")
+            if backup_left:
+                warnings.append(f"旧版本备份未能自动清理（目录被占用），可手动删除 skills/custom/.{skill_id}.upgrade-bak")
+            if warnings:
+                result["warnings"] = warnings
+            return result
+    finally:
+        try:
+            os.remove(temp_zip)
+        except OSError:
+            pass
+
+# --- 画布生图 Skill 编译注入（PRD FR2-7/FR2-9） ---
+
+SKILL_COMPILE_CACHE_FILE = os.path.join(DATA_DIR, "skill_compile_cache.json")
+SKILL_COMPILE_CACHE_LIMIT = 200
+SKILL_COMPILE_LOCKS = {}
+SKILL_COMPILE_LOCKS_GUARD = Lock()
+
+def skill_compile_lock(key):
+    with SKILL_COMPILE_LOCKS_GUARD:
+        lock = SKILL_COMPILE_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            SKILL_COMPILE_LOCKS[key] = lock
+        return lock
+
+def skill_compile_cache_load():
+    try:
+        with open(SKILL_COMPILE_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def skill_compile_cache_save(cache):
+    """唯一临时文件 + flush/fsync + 原子替换（二次校审 P2）。
+    调用方必须持有 _SKILL_CACHE_FILE_LOCK，避免跨 key 并发互相覆盖。"""
+    tmp_path = ""
+    try:
+        if len(cache) > SKILL_COMPILE_CACHE_LIMIT:
+            trimmed = sorted(cache.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:SKILL_COMPILE_CACHE_LIMIT]
+            cache = dict(trimmed)
+        cache_dir = os.path.dirname(SKILL_COMPILE_CACHE_FILE) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix="skill_cache_", suffix=".tmp", dir=cache_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SKILL_COMPILE_CACHE_FILE)
+        tmp_path = ""
+    except Exception:
+        pass
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+_SKILL_CACHE_FILE_LOCK = asyncio.Lock()
+
+async def skill_compile_cache_merge(key, record):
+    """全局文件锁内完成 读取→合并→原子写：跨 key 并发不会互相覆盖（二次校审 P2）。"""
+    async with _SKILL_CACHE_FILE_LOCK:
+        cache = skill_compile_cache_load()
+        cache[key] = record
+        skill_compile_cache_save(cache)
+
+def skill_content_snapshot(dir_path):
+    """skill 内容快照 ID：一律用 SKILL.md 内容哈希——升级/编辑后自动失效 LLM 缓存；
+    commit_sha 仅作溯源展示（审查 P1-2：编辑后 commit_sha 不变，不能作缓存键）。"""
+    try:
+        with open(os.path.join(dir_path, "SKILL.md"), "rb") as f:
+            return "content:" + hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return "content:unknown"
+
+try:
+    SKILL_FAST_PROMPT_MAX = max(1000, int(os.getenv("SKILL_FAST_PROMPT_MAX", "3800")))
+except Exception:
+    SKILL_FAST_PROMPT_MAX = 3800
+
+def compose_skill_prompt_fast(body_text, user_prompt, variant=None):
+    """快速模式拼接：skill 指令 + 样式变体 + 用户需求，总长受 SKILL_FAST_PROMPT_MAX 约束
+    （ModelScope 等上游 prompt 上限约 4000，实测验收发现超限被拒）。"""
+    instruction = re.sub(r"\s+", " ", str(body_text or "")).strip()
+    prompt_text = str(user_prompt or "").strip()
+    prefix = "请严格按照以下 Skill 指令生成图像。Skill 指令："
+    variant_text = ""
+    if variant and (variant.get("prompt") or variant.get("label")):
+        variant_text = f" 本次必须采用样式变体「{variant.get('label') or variant.get('id')}」：{str(variant.get('prompt') or '').strip()}"
+    middle = f"{variant_text} 用户需求："
+    budget = max(500, SKILL_FAST_PROMPT_MAX - len(prefix) - len(middle) - len(prompt_text))
+    if len(instruction) > budget:
+        instruction = instruction[:budget].rstrip() + "…（Skill 指令超出长度上限，已截取核心部分）"
+    return f"{prefix}{instruction}{middle}{prompt_text}"
+
+SKILL_LLM_SYSTEM_PROMPT = (
+    "你是生图提示词改写助手。请根据 SKILL 指令把用户需求改写成一条最终的生图提示词。"
+    "要求：1) 融合 Skill 指令中的风格、构图、材质、光线与约束；2) 完整保留用户需求的核心意图与主体；"
+    "3) 直接输出最终提示词本身，不要任何解释、前后缀或列表。"
+)
+
+async def compile_skill_prompt(selection, user_prompt):
+    """按 Skill 编译最终提示词（fast=确定性拼接；llm=LLM 改写+缓存）。"""
+    source = str(selection.source or "custom").strip().lower()
+    if source not in ("custom", "builtin"):
+        source = "custom"
+    mode = str(selection.mode or "fast").strip().lower()
+    if mode not in ("fast", "llm"):
+        mode = "fast"
+    dir_path = skill_dir_for(source, str(selection.id))
+    if not os.path.isfile(os.path.join(dir_path, "SKILL.md")):
+        raise HTTPException(status_code=400, detail=f"Skill 缺少 SKILL.md，无法编译：{selection.id}")
+    entry = skill_entry_from_dir(dir_path, source, include_body=True)
+    variants = entry.get("variants") or []
+    variant = next((v for v in variants if str(v.get("id") or "") == str(selection.variant or "").strip()), None)
+    snapshot = skill_content_snapshot(dir_path)
+    skill_used = {
+        "id": entry["id"],
+        "name": entry.get("name") or entry["id"],
+        "source": source,
+        "sha": snapshot,
+        "mode": mode,
+        "version": entry.get("version") or "",
+        "variant": {"id": variant["id"], "label": variant.get("label") or ""} if variant else None,
+    }
+    if mode == "fast":
+        return {"compiled_prompt": compose_skill_prompt_fast(entry.get("body") or "", user_prompt, variant), "skill_used": skill_used, "cached": False}
+    provider = str(selection.provider or "").strip()
+    if not provider:
+        # 智能模式默认走 Codex 聊天通道（订阅额度、成本低）；primary 可能是纯生图平台
+        provider = "codex" if any(p.get("protocol") == "codex" and p.get("enabled", True) for p in load_api_providers()) else get_primary_provider_id()
+    llm_model = str(selection.model or "").strip()
+    # 缓存 key 含 provider/model（切换 LLM 平台不串用）与 variant（切样板不串用——校审 P1-3）
+    variant_part = f"{variant.get('id') or ''}|{variant.get('prompt') or ''}" if variant else "-"
+    key = hashlib.sha256(f"{snapshot}|{mode}|{provider}|{llm_model}|{str(selection.variant or '').strip()}|{variant_part}|{user_prompt}".encode("utf-8")).hexdigest()
+    # 同 key 并发（generator count>1）串行化：后到者直接命中先到者写入的缓存（审查 P2-3）
+    async with skill_compile_lock(key):
+        cache = skill_compile_cache_load()
+        hit = cache.get(key)
+        if isinstance(hit, dict) and hit.get("compiled_prompt"):
+            return {"compiled_prompt": str(hit["compiled_prompt"]), "skill_used": skill_used, "cached": True}
+        skill_body = (entry.get("body") or "").strip()[:8000]
+        variant_directive = ""
+        if variant and (variant.get("prompt") or variant.get("label")):
+            variant_directive = f"\n\n本次必须采用样式变体「{variant.get('label') or variant.get('id')}」：{str(variant.get('prompt') or '').strip()}"
+        user_part = str(user_prompt or "").strip() or "（无附加文字需求，按 SKILL 指令处理所给参考图）"
+        message = f"SKILL 指令：\n{skill_body}{variant_directive}\n\n用户需求：{user_part}"
+        if len(message) > LLM_MESSAGE_MAX_LENGTH:
+            raise HTTPException(status_code=400, detail=f"提示词过长（{len(message)} > {LLM_MESSAGE_MAX_LENGTH}），请缩短用户需求或 Skill 正文")
+        llm_payload = CanvasLLMRequest(
+            message=message,
+            system_prompt=SKILL_LLM_SYSTEM_PROMPT,
+            provider=provider,
+            model=llm_model,
+        )
+        llm_result = await canvas_llm(llm_payload)
+        compiled = str(llm_result.get("text") or "").strip()
+        if not compiled:
+            raise HTTPException(status_code=502, detail="Skill 智能改写返回了空结果，请改用快速模式或检查 LLM 平台配置")
+        await skill_compile_cache_merge(key, {"compiled_prompt": compiled, "skill_sha": snapshot, "at": now_ms()})
+        return {"compiled_prompt": compiled, "skill_used": skill_used, "cached": False}
+
+def skill_diff_for_preview(selection, user_prompt):
+    """提示词预览（快速模式零成本同步返回；智能模式由前端触发真实编译预览接口）。"""
+    source = str(selection.source or "custom").strip().lower()
+    if source not in ("custom", "builtin"):
+        source = "custom"
+    dir_path = skill_dir_for(source, str(selection.id))
+    if not os.path.isfile(os.path.join(dir_path, "SKILL.md")):
+        raise HTTPException(status_code=400, detail=f"Skill 缺少 SKILL.md，无法预览：{selection.id}")
+    entry = skill_entry_from_dir(dir_path, source, include_body=True)
+    mode = str(selection.mode or "fast").strip().lower()
+    if mode == "fast":
+        return {"mode": "fast", "compiled_prompt": compose_skill_prompt_fast(entry.get("body") or "", user_prompt)}
+    return {"mode": "llm", "compiled_prompt": "", "note": "智能模式将在生成时由 LLM 改写（结果会缓存）"}
+
+class SkillPreviewRequest(BaseModel):
+    source: str = "custom"
+    id: str = Field(min_length=1, max_length=80)
+    mode: str = "fast"
+    variant: str = ""
+    model: str = ""
+    provider: str = ""
+    prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+
+@app.post("/api/skills/preview-prompt")
+async def api_skill_preview_prompt(payload: SkillPreviewRequest):
+    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant, model=payload.model or "", provider=payload.provider or "")
+    return skill_diff_for_preview(selection, payload.prompt)
+
+SKILL_VARIANT_SUGGEST_SYSTEM = (
+    "你是 Skill 样式分析器。阅读给定的 SKILL.md 指令，识别其中可枚举的风格样板/变体"
+    "（例如不同的墨色/配色/材质/纹理/构图家族/处理方式/输出形态）。"
+    "只提取该 Skill 明确支持或暗示的离散选项，不要发明 Skill 之外的东西。"
+    "输出严格 JSON 数组，每项形如 {\"id\": \"小写短横线英文id\", \"label\": \"中文样板名（含关键参数）\", \"prompt\": \"该样板的英文追加指令，一句话，含关键参数\"}，最多 12 项。"
+    "若该 Skill 没有可枚举的样式变体，输出 []。不要输出任何解释。"
+)
+
+class SkillVariantSuggestRequest(BaseModel):
+    provider: str = ""
+    model: str = ""
+
+@app.post("/api/skills/custom/{skill_id}/suggest-variants")
+async def api_skill_suggest_variants(skill_id: str, payload: SkillVariantSuggestRequest):
+    """用 LLM 分析 SKILL.md，自动识别可枚举的风格样板（消耗少量 LLM 额度）。"""
+    dir_path = skill_dir_for("custom", skill_id)
+    entry = skill_entry_from_dir(dir_path, "custom", include_body=True)
+    if not entry.get("has_skill_md"):
+        raise HTTPException(status_code=400, detail="缺少 SKILL.md，无法分析")
+    skill_text = (entry.get("body") or "").strip()[:8000]
+    if not skill_text:
+        raise HTTPException(status_code=400, detail="SKILL.md 正文为空，无可分析内容")
+    provider = str(payload.provider or "").strip() or get_primary_provider_id()
+    llm_payload = CanvasLLMRequest(
+        message=skill_text,
+        system_prompt=SKILL_VARIANT_SUGGEST_SYSTEM,
+        provider=provider,
+        model=str(payload.model or "").strip(),
+    )
+    result = await canvas_llm(llm_payload)
+    text = str(result.get("text") or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise HTTPException(status_code=502, detail="LLM 未返回有效的样板 JSON，请重试或改用其他 LLM 平台")
+    try:
+        items = json.loads(text[start:end + 1])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"样板 JSON 解析失败：{exc}") from exc
+    suggestions = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()[:80]
+        vprompt = str(item.get("prompt") or "").strip()[:2000]
+        vid = normalize_skill_id(str(item.get("id") or "")) or normalize_skill_id(label)
+        if not label or not vid:
+            continue
+        suggestions.append({"id": vid, "label": label, "prompt": vprompt})
+    return {"ok": True, "suggestions": suggestions[:12], "provider": provider, "model": result.get("model") or ""}
+
+@app.post("/api/skills/compile-prompt")
+async def api_skill_compile_prompt(payload: SkillPreviewRequest):
+    """智能模式的真实编译预览（走 LLM，结果进缓存；调用会消耗 LLM 额度）。"""
+    selection = SkillSelection(source=payload.source, id=payload.id, mode=payload.mode, variant=payload.variant, model=payload.model or "", provider=payload.provider or "")
+    result = await compile_skill_prompt(selection, payload.prompt)
+    return result
 
 if __name__ == "__main__":
     import uvicorn

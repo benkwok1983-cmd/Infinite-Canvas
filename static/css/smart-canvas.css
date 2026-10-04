@@ -1223,6 +1223,8 @@ video.node-img { object-fit:cover; background:#0f172a; }
 .direct-option:hover { background:var(--soft); border-color:var(--line); color:var(--text); transform:translateY(-1px); }
 .direct-option.active { background:var(--card); border-color:var(--line); color:var(--strong); font-weight:650; box-shadow:inset 0 0 0 1px rgba(15,23,42,.02); }
 .direct-option.active::after { content:""; width:5px; height:5px; border-radius:999px; background:var(--strong); margin-left:auto; flex:0 0 auto; }
+.direct-option .exp-tag { flex:0 0 auto; margin-left:6px; padding:1px 5px; border-radius:6px; background:rgba(245,158,11,.16); color:#b45309; font-size:10px; font-weight:800; font-style:normal; letter-spacing:.02em; }
+.theme-dark .direct-option .exp-tag { background:rgba(245,158,11,.2); color:#fbbf24; }
 .model-list::-webkit-scrollbar,.direct-picker-col::-webkit-scrollbar { width:7px; height:7px; }
 .model-list::-webkit-scrollbar-track,.direct-picker-col::-webkit-scrollbar-track { background:transparent; border-radius:999px; }
 .model-list::-webkit-scrollbar-thumb,.direct-picker-col::-webkit-scrollbar-thumb { background:rgba(148,163,184,.42); border-radius:999px; border:2px solid transparent; background-clip:content-box; }

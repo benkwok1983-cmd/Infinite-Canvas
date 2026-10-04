@@ -31,6 +31,7 @@
         "nav.gpt": { zh: "GPT 对话", en: "GPT Chat" },
         "nav.canvas": { zh: "无限画布", en: "Infinite Canvas" },
         "nav.assetManager": { zh: "素材库", en: "Assets" },
+        "nav.skillManager": { zh: "Skill 库", en: "Skills" },
         "bulk.manage": { zh: "管理", en: "Manage" },
         "bulk.selectAll": { zh: "全选", en: "Select All" },
         "bulk.deselectAll": { zh: "取消全选", en: "Deselect All" },

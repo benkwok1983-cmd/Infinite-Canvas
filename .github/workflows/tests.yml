@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyyaml
+      - name: Run test suites
+        run: |
+          # 用 unittest 自动发现，避免新增测试文件被忘记加入 CI。
+          # 之前这里是逐个列出测试文件，结果 tests/test_canvas_log_cleanup.py
+          # 一直没被执行；该文件引用的四个符号在 main.py 中已随功能重写被移除，
+          # 测试早已失效却因为不在列表里而无人发现（已删除该文件）。
+          python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Sensitive info guard
+        shell: bash
+        run: |
+          # 校审要求：日志与代码中不得出现完整 API Key / 带密钥命令行。
+          #
+          # 只匹配「把密钥当作字面量」或「把密钥写进日志」这两种真实风险：
+          #   1) sk- 开头的 OpenAI 风格密钥字面量（哪怕只是出现在源码字符串里）
+          #   2) 打印 / 记录密钥或完整 argv（含密钥）到 stdout、log、debug 输出
+          #
+          # 注意不要匹配「把密钥作为变量传给子进程」这种正常用法，例如
+          #   ["--provider", "openai", "--api-key", api_key]
+          # 这类代码只是引用变量，密钥本身不落在源码里，是安全的。
+          # （旧规则里的 `--api-key.*$` 因 `$` 是行尾锚点，会命中所有含
+          #   --api-key 的行，把上面这种安全写法也判为违规。）
+          #
+          # 用 Python 而非 grep 做正则：grep 的 BRE/ERE 处理 `$`、`\{` 等
+          # 转义在不同实现下行为不一致，容易再次出现误报或漏报。
+          python - <<'PYEOF'
+          import re, sys, pathlib
+
+          src = pathlib.Path("main.py").read_text(encoding="utf-8")
+
+          checks = [
+              # 硬编码的 OpenAI 风格密钥
+              ("hardcoded-openai-key", r"""sk-[A-Za-z0-9]{20,}"""),
+              # 把密钥/完整 argv 写进日志或打印
+              ("secret-in-log",
+               r"""(?:print|log(?:ger|ging)?|debug)\s*\(?[^)\n]*"""
+               r"""(?:api_key|apiKey|FULL_ARGV|argv)"""),
+          ]
+
+          hits = []
+          for name, pattern in checks:
+              for m in re.finditer(pattern, src, re.I):
+                  line = src.count("\n", 0, m.start()) + 1
+                  snippet = src.splitlines()[line - 1].strip()[:100]
+                  hits.append(f"  main.py:{line}  [{name}]  {snippet}")
+
+          if hits:
+              print("::error::敏感信息输出模式命中，请人工复核")
+              print("\n".join(hits))
+              sys.exit(1)
+          print("sensitive-info guard passed")
+          PYEOF
