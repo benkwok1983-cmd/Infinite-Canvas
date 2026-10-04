@@ -1,6 +1,20 @@
 # Infinite-Canvas
 Supports comfyui/API calls/modelscope calls
 
+2026/08/28:
+
+此项目已停更，全新版本请前往：www.DX-OS.com 下载。
+
+功能特性：
+1. 画布功能全新升级，支持Agent/一键分层/多人协同/共享画布/免费公网图床
+2. 软件内即可启动ComfyUI/映射工作流等
+3. 海量免费APP可下载
+4. 全新的账号管理/APP权限系统
+5. 提供开发者模式，可以开发自己公司的业务软件离线运行
+
+-----
+
+
 配套的chrome采集插件已经上线：https://chromewebstore.google.com/detail/infinite-canvas-%E5%9B%BE%E5%83%8F%E8%A7%86%E9%A2%91%E6%96%87%E5%AD%97%E6%8A%93%E5%8F%96%E5%B7%A5/ajfhnbklbmpfaaookhfakohabnpmlcic?authuser=0&hl=en
 
 详细教程：[https://youtu.be/1y9ShTvgC_w](https://youtu.be/r_y_9ALr7fg)
