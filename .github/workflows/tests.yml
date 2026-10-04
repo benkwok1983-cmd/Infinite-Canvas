@@ -17,9 +17,11 @@ jobs:
         run: pip install -r requirements.txt pyyaml
       - name: Run test suites
         run: |
-          python tests/test_skill_injection.py
-          python tests/test_skill_library.py
-          python tests/test_gpt_image_2_skill_args.py
+          # 用 unittest 自动发现，避免新增测试文件被忘记加入 CI。
+          # 之前这里是逐个列出测试文件，结果 tests/test_canvas_log_cleanup.py
+          # 一直没被执行；该文件引用的四个符号在 main.py 中已随功能重写被移除，
+          # 测试早已失效却因为不在列表里而无人发现（已删除该文件）。
+          python -m unittest discover -s tests -p "test_*.py" -v
       - name: Sensitive info guard
         shell: bash
         run: |

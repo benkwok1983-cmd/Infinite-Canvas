@@ -2,6 +2,7 @@ import json
 import uuid
 import base64
 import hashlib
+import ipaddress
 import hmac
 import datetime
 import urllib.request
@@ -163,11 +164,20 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.06.03"
-GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
-GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
-GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
-GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main"
+
+# 本项目是 hero8152/Infinite-Canvas 的 fork，Codex 生图与 Skill 等功能只存在于本 fork。
+# 而更新器不是增量安装：static/ 会被整目录删除后重新拷贝，main.py 也会被整文件替换。
+# 若更新源仍指向原上游仓库，点一次更新就会把 fork 的功能覆盖回上游版本，且不可逆。
+# 因此更新源必须指向本 fork 自己的仓库。
+GITHUB_REPO_URL = "https://github.com/benkwok1983-cmd/Infinite-Canvas"
+GITHUB_BRANCH = "zcode/iteration-01"
+GITHUB_VERSION_URL = f"https://raw.githubusercontent.com/benkwok1983-cmd/Infinite-Canvas/{GITHUB_BRANCH}/VERSION"
+GITHUB_TREE_URL = f"https://api.github.com/repos/benkwok1983-cmd/Infinite-Canvas/git/trees/{GITHUB_BRANCH}?recursive=1"
+GITHUB_RAW_ROOT = f"https://raw.githubusercontent.com/benkwok1983-cmd/Infinite-Canvas/{GITHUB_BRANCH}"
 GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
+
+# ModelScope 更新源同理需要指向本 fork 的发布位置；本 fork 尚未在该站发布时，探测会
+# 失败并在响应里给出 fallback_used，用户能看到"该源不可用"，而不是静默覆盖成上游版本。
 MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
 MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
 # ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
@@ -282,8 +292,7 @@ def save_storage_settings(payload):
     for path in dirs.values():
         os.makedirs(path, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(STORAGE_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(dirs, f, ensure_ascii=False, indent=2)
+    atomic_write_json(STORAGE_SETTINGS_FILE, dirs, indent=2)
     apply_storage_settings(dirs)
     return {"dirs": dirs}
 
@@ -295,6 +304,64 @@ def apply_storage_settings(dirs=None):
     LOCAL_UPLOAD_DIR = dirs.get("local") or LOCAL_UPLOAD_DIR
 
 apply_storage_settings()
+
+def replace_with_retry(src: str, dst: str, *, timeout: float = 5.0) -> None:
+    """os.replace 的带重试版本，用于 Windows。
+
+    Windows 上普通的 open() 不带 FILE_SHARE_DELETE，读者打开目标文件期间
+    os.replace 会直接抛 PermissionError(WinError 5)——即使只是 json.load 读了一瞬间。
+    本项目每个请求都要读画布/会话文件，读者数量不少，不重试的话保存会随机 500。
+    这里在超时窗口内退避重试；读者是短临界区，通常第一次或第二次就成功。
+    退避期间仍持有上面的临时文件，读者看到的始终是旧完整内容。
+    """
+    deadline = time.monotonic() + timeout
+    delay = 0.001
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+
+
+def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = 2,
+                      trailing_newline: bool = False) -> None:
+    """把 JSON 原子地写入磁盘。
+
+    直接 open(path, "w") 会先截断文件、再逐块写内容。如果进程在写到一半时被
+    强杀、断电或磁盘写满，磁盘上会留下半截 JSON，下次读取 json.load 直接失败，
+    用户数据（画布、会话、历史等）就此损坏且无法恢复。
+
+    这里改为：写到同目录下的唯一临时文件 → flush → fsync 确保落盘 →
+    os.replace 原子替换目标文件。os.replace 在同一文件系统内是原子操作，
+    因此目标文件要么是旧的完整内容，要么是新的完整内容，不会出现中间态。
+    必须写在同一个目录——跨文件系统的 rename 不是原子的。
+
+    并发写入同一路径时，每个调用各自持有唯一临时文件，最后一次 replace 生效，
+    不会出现两个写者互相写坏同一个临时文件的问题。
+    """
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            if trailing_newline:
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        replace_with_retry(tmp_path, target)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 QUEUE = []
 QUEUE_LOCK = Lock()
@@ -1341,8 +1408,7 @@ def load_api_providers():
 def save_api_providers(providers):
     os.makedirs(DATA_DIR, exist_ok=True)
     with GLOBAL_CONFIG_LOCK:
-        with open(API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(providers, f, ensure_ascii=False, indent=2)
+        atomic_write_json(API_PROVIDERS_FILE, providers, indent=2)
 
 def default_runninghub_static_provider():
     return {
@@ -1397,9 +1463,7 @@ def mutate_static_runninghub_provider(mutator):
     changed = mutator(provider)
     if changed is False:
         return False
-    with open(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    atomic_write_json(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, raw, indent=2, trailing_newline=True)
     return True
 
 def sync_runninghub_provider_workflows_to_static_template(provider):
@@ -2159,6 +2223,7 @@ def download_modelscope_update_files(staging_root: str) -> List[str]:
             f.write(data)
     return files
 
+
 def safe_update_target(path: str) -> str:
     rel = str(path or "").replace("\\", "/").lstrip("/")
     if not update_allowed_file(rel):
@@ -2303,10 +2368,26 @@ def staged_update_file_list(staging_root: str) -> Tuple[List[str], List[str], Li
 
 UPDATE_SOURCE_LABELS = {"github": "GitHub", "modelscope": "ModelScope"}
 
+# ModelScope 上的 Infinite-Canvas 发布页是原上游仓库 hero8152/daniel8152 的，
+# 里面没有本 fork 的 Codex 生图与 Skill 代码。而更新是整目录替换 static/ 加整文件
+# 替换 main.py，一旦从该源更新就会把 fork 的功能覆盖回上游版本，且备份只能事后补救。
+# 因此本 fork 禁用 ModelScope 更新源；等在 ModelScope 上建立本 fork 的发布页后，
+# 把下面的开关改为 True 并同步更新 MODELSCOPE_* 常量即可恢复。
+ALLOW_MODELSCOPE_UPDATE_SOURCE = False
+
+MODELSCOPE_UPDATE_SOURCE_DISABLED_HINT = (
+    "本项目是上游的 fork，ModelScope 上的发布页仍是上游版本，"
+    "从该源更新会覆盖掉 fork 独有的功能（如 Codex 生图、Skill）。"
+    "请改用 GitHub 源更新。"
+)
+
 def normalize_update_source(value: str) -> str:
     source = str(value or "github").strip().lower()
     if source == "ms":
-        return "modelscope"
+        source = "modelscope"
+    # 禁用源一律回落到 GitHub（指向本 fork），而不是报错，避免更新功能整体不可用。
+    if source == "modelscope" and not ALLOW_MODELSCOPE_UPDATE_SOURCE:
+        return "github"
     if source not in {"github", "modelscope"}:
         return "github"
     return source
@@ -2368,11 +2449,10 @@ def read_update_backup_manifest(backup_dir: str) -> Dict[str, Any]:
         return {}
 
 def write_update_backup_manifest(backup_dir: str, payload: Dict[str, Any]) -> None:
-    path = update_backup_manifest_path(backup_dir)
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(temp_path, path)
+    # 之前用固定的 "<path>.tmp" 作为临时名：并发写同一个 backup 时两个写者会打开
+    # 同一个临时文件互相覆盖，os.replace 拿到的内容可能是拼接出来的坏 JSON，
+    # 后续回滚就找不到可用备份。atomic_write_json 用唯一临时名规避了这一点。
+    atomic_write_json(update_backup_manifest_path(backup_dir), payload, indent=2)
 
 def count_regular_files(path: str) -> int:
     return sum(len(files) for _, _, files in os.walk(path)) if os.path.isdir(path) else 0
@@ -2477,7 +2557,11 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
     source_order = [requested_source]
     if req.fallback:
         other = "modelscope" if requested_source == "github" else "github"
-        source_order.append(other)
+        # 兜底源也要经过 normalize：禁用的源在这里被排除，否则即使主源失败，
+        # 仍会静默回落到上游的 ModelScope 发布页，把 fork 覆盖回上游版本。
+        other = normalize_update_source(other)
+        if other != requested_source and other not in source_order:
+            source_order.append(other)
     try:
         backup_root = ""
         backup_manifest: Dict[str, Any] = {}
@@ -3516,8 +3600,7 @@ def save_to_history(record):
         if "timestamp" not in record:
             record["timestamp"] = time.time()
         history.insert(0, record)
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history[:5000], f, ensure_ascii=False, indent=4)
+        atomic_write_json(HISTORY_FILE, history[:5000], indent=4)
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
@@ -3552,8 +3635,7 @@ def now_ms():
 def save_conversation(user_id, conversation):
     with CONVERSATION_LOCK:
         path = conversation_path(user_id, conversation["id"])
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(conversation, f, ensure_ascii=False, indent=2)
+        atomic_write_json(path, conversation, indent=2)
 
 def new_conversation(user_id, title="新对话"):
     timestamp = now_ms()
@@ -3602,11 +3684,61 @@ def canvas_path(canvas_id):
         raise HTTPException(status_code=400, detail="无效的画布 ID")
     return os.path.join(CANVAS_DIR, f"{cleaned}.json")
 
-def save_canvas(canvas):
-    canvas["updated_at"] = now_ms()
+# 每个画布一把事务锁。
+# 之前所有画布共用一把 CANVAS_LOCK，而且锁只包住"写"这一步，"读 → 比较 → 改 → 写"
+# 整段都在锁外。于是两个并发请求（例如自动保存触发的 touch 与主编辑的 PUT 同时到达）
+# 会各自读到同一份旧快照，后写的把先写的整份覆盖掉，且不留任何痕迹。
+# 现在把整段读-改-放进同一把画布级锁，既杜绝覆盖，又不会让 A 画布的保存阻塞 B 画布。
+CANVAS_TRANSACTION_LOCKS = {}
+CANVAS_TRANSACTION_LOCKS_GUARD = Lock()
+
+def canvas_transaction_lock(canvas_id):
+    key = str(canvas_id or "")
+    with CANVAS_TRANSACTION_LOCKS_GUARD:
+        lock = CANVAS_TRANSACTION_LOCKS.get(key)
+        if lock is None:
+            lock = Lock()
+            CANVAS_TRANSACTION_LOCKS[key] = lock
+        return lock
+
+def next_canvas_updated_at(previous):
+    """返回严格大于 previous 的时间戳。
+
+    原来直接取 now_ms()。同一毫秒里连续两次保存会拿到相同的 updated_at，而客户端
+    的冲突检测用的是 `<` 比较：相等时旧版本照样被接受，冲突检测等于失效；画布列表
+    的排序也会出现并列。这里保证每次至少比上一次大 1。
+    """
+    try:
+        previous = int(previous or 0)
+    except (TypeError, ValueError):
+        previous = 0
+    return max(now_ms(), previous + 1)
+
+def write_canvas(canvas, *, bump_updated_at=True):
+    """把画布落盘。调用方必须已持有该画布的事务锁（canvas_transaction_lock）。"""
+    if bump_updated_at:
+        canvas["updated_at"] = next_canvas_updated_at(canvas.get("updated_at"))
     with CANVAS_LOCK:
-        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
-            json.dump(canvas, f, ensure_ascii=False, indent=2)
+        atomic_write_json(canvas_path(canvas["id"]), canvas, indent=2)
+    return canvas
+
+def save_canvas(canvas):
+    """单画布的读-改-写事务入口：加锁后落盘。"""
+    with canvas_transaction_lock(canvas.get("id")):
+        return write_canvas(canvas)
+
+def mutate_canvas(canvas_id, mutator, *, allow_deleted=False, bump_updated_at=True):
+    """在一个事务里完成"读取 → 修改 → 落盘"，全程持有该画布的事务锁。
+
+    mutator 直接修改传入的 canvas；返回 False 表示本次无需改动、不落盘。
+    任何读到旧快照后要写回的逻辑都必须走这里，否则会覆盖并发写入。
+    bump_updated_at=False 用于刻意不改 updated_at 的写入（打标签、置顶）。
+    """
+    with canvas_transaction_lock(canvas_id):
+        canvas = load_canvas_any(canvas_id) if allow_deleted else load_canvas(canvas_id)
+        if mutator(canvas) is False:
+            return canvas
+        return write_canvas(canvas, bump_updated_at=bump_updated_at)
 
 def normalize_canvas_kind(kind="classic"):
     return "smart" if str(kind or "").strip().lower() == "smart" else "classic"
@@ -3628,8 +3760,7 @@ def load_projects():
 
 def save_projects(projects):
     with CANVAS_LOCK:
-        with open(PROJECTS_PATH, 'w', encoding='utf-8') as f:
-            json.dump({"projects": projects}, f, ensure_ascii=False, indent=2)
+        atomic_write_json(PROJECTS_PATH, {"projects": projects}, indent=2)
 
 def project_record(p):
     return {
@@ -3743,11 +3874,15 @@ def canvas_record(data):
 
 def cleanup_expired_canvas_trash():
     cutoff = now_ms() - CANVAS_TRASH_RETENTION_MS
-    with CANVAS_LOCK:
-        for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
-                continue
-            path = os.path.join(CANVAS_DIR, filename)
+    for filename in os.listdir(CANVAS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(CANVAS_DIR, filename)
+        canvas_id = filename[:-len(".json")]
+        # 逐个画布加锁删除：否则清理线程可能在一个保存事务的读-改-写之间把文件删掉，
+        # 事务随后又把内容写回磁盘，等于绕过了 30 天保留期；反过来若删除与保存
+        # 交错，还会出现删了又出现的画布。
+        with canvas_transaction_lock(canvas_id):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -7903,8 +8038,7 @@ def _read_local_upload_classification(filename):
 
 def _write_local_upload_classification(filename, classification):
     path = _local_upload_classification_path(filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(normalize_asset_classification(classification), f, ensure_ascii=False, indent=2)
+    atomic_write_json(path, normalize_asset_classification(classification), indent=2)
 
 def asset_classification_prompt(extra_prompt=""):
     base = load_asset_classification_prompt()
@@ -8030,8 +8164,7 @@ def save_asset_library(lib):
     sort_asset_library_items(lib)
     lib["updated_at"] = now_ms()
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(ASSET_LIBRARY_PATH, "w", encoding="utf-8") as f:
-        json.dump(lib, f, ensure_ascii=False, indent=2)
+    atomic_write_json(ASSET_LIBRARY_PATH, lib, indent=2)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_asset_library_updated(int(lib["updated_at"])), GLOBAL_LOOP)
 
@@ -8091,8 +8224,7 @@ def shared_folders_load():
 
 def shared_folders_save(data):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(SHARED_FOLDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(SHARED_FOLDERS_FILE, data, indent=2)
 
 def shared_folder_by_id(folder_id):
     for entry in shared_folders_load().get("folders", []):
@@ -8361,8 +8493,7 @@ def save_prompt_libraries(data):
     data = normalize_prompt_libraries(data)
     data["updated_at"] = now_ms()
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PROMPT_LIBRARY_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(PROMPT_LIBRARY_PATH, data, indent=2)
     return data
 
 def public_prompt_libraries(data=None):
@@ -13585,8 +13716,36 @@ async def save_providers(payload: List[ApiProviderPayload]):
 
 # --- ModelScope Token (从 env 读取，不再支持通过 UI 修改) ---
 
+def _is_loopback_or_lan_host(host: str) -> bool:
+    """判断来源是否为本机或局域网地址。仅用于告警提示，不做拦截。
+
+    之所以只告警不拦截：本服务按工作室需求监听 0.0.0.0 供局域网共享，
+    局域网页面（如 zimage / angle）本来就需要访问本接口。
+    """
+    try:
+        addr = ipaddress.ip_address(str(host or "").strip())
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private
+
+
 @app.get("/api/config/token")
-async def get_global_token():
+async def get_global_token(request: Request):
+    """把已保存的 ModelScope Token 下发给同源的 zimage / angle 页面。
+
+    这两个页面需要把 Token 交给外部的 /generate 服务（由 ModelScope 侧提供，
+    不在本进程内），所以 Token 必须经过浏览器中转，无法改成后端代理而不改动
+    那条链路的架构。因此这里保留原行为，但记录访问来源，便于发现异常访问。
+
+    注意该响应不进入日志：access log 只记录路径不记录响应体，body 里也不要
+    加任何打印，否则等于把密钥写进日志。
+    """
+    client_host = request.client.host if request.client else ""
+    if not _is_loopback_or_lan_host(client_host):
+        logging.getLogger("uvicorn.access").warning(
+            "警告：/api/config/token 被非本机来源访问 (client=%s)", client_host
+        )
+
     # 优先读 env，回退到 global_config.json（兼容旧数据）
     saved_token = modelscope_api_key()
     if saved_token:
@@ -16431,21 +16590,25 @@ async def delete_project(project_id: str):
     save_projects(projects)
     # 把该项目下的画布迁回默认项目
     moved = 0
-    with CANVAS_LOCK:
-        for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
-                continue
-            path = os.path.join(CANVAS_DIR, filename)
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            if str(data.get("project") or "") == project_id:
-                data["project"] = DEFAULT_PROJECT_ID
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+    for filename in os.listdir(CANVAS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        canvas_id = filename[:-len(".json")]
+        matched = []
+        def move(canvas, _pid=project_id):
+            if str(canvas.get("project") or "") != _pid:
+                return False
+            canvas["project"] = DEFAULT_PROJECT_ID
+            matched.append(True)
+
+        try:
+            mutate_canvas(canvas_id, move, allow_deleted=True, bump_updated_at=False)
+            if matched:
                 moved += 1
+        except HTTPException:
+            continue
+        except Exception:
+            continue
     return {"ok": True, "moved": moved}
 
 @app.get("/api/canvases/trash")
@@ -16470,27 +16633,27 @@ async def get_canvas_meta(canvas_id: str):
 @app.post("/api/canvases/{canvas_id}/meta")
 async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
     """更新画布的轻量元数据（标题/图标/负责人/颜色/置顶）。
-    刻意不走 save_canvas（它会刷新 updated_at），以免打标签/置顶把画布顶到列表最前。"""
-    canvas = load_canvas(canvas_id)
-    if payload.title is not None:
-        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
-    if payload.icon is not None:
-        canvas["icon"] = (payload.icon or "layers")[:32]
-    if payload.owner is not None:
-        canvas["owner"] = str(payload.owner).strip()[:40]
-    if payload.color is not None:
-        canvas["color"] = normalize_canvas_color(payload.color)
-    if payload.pinned is not None:
-        canvas["pinned"] = bool(payload.pinned)
-    if payload.project is not None:
-        canvas["project"] = str(payload.project).strip() or DEFAULT_PROJECT_ID
-    if payload.board_x is not None:
-        canvas["board_x"] = float(payload.board_x)
-    if payload.board_y is not None:
-        canvas["board_y"] = float(payload.board_y)
-    with CANVAS_LOCK:
-        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
-            json.dump(canvas, f, ensure_ascii=False, indent=2)
+    刻意不刷新 updated_at（bump_updated_at=False），以免打标签/置顶把画布顶到列表最前。"""
+
+    def apply(canvas):
+        if payload.title is not None:
+            canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+        if payload.icon is not None:
+            canvas["icon"] = (payload.icon or "layers")[:32]
+        if payload.owner is not None:
+            canvas["owner"] = str(payload.owner).strip()[:40]
+        if payload.color is not None:
+            canvas["color"] = normalize_canvas_color(payload.color)
+        if payload.pinned is not None:
+            canvas["pinned"] = bool(payload.pinned)
+        if payload.project is not None:
+            canvas["project"] = str(payload.project).strip() or DEFAULT_PROJECT_ID
+        if payload.board_x is not None:
+            canvas["board_x"] = float(payload.board_x)
+        if payload.board_y is not None:
+            canvas["board_y"] = float(payload.board_y)
+
+    canvas = mutate_canvas(canvas_id, apply, bump_updated_at=False)
     return {"canvas": canvas_record(canvas)}
 
 @app.get("/api/canvases/{canvas_id}")
@@ -16499,8 +16662,7 @@ async def get_canvas(canvas_id: str):
 
 @app.post("/api/canvases/{canvas_id}/touch")
 async def touch_canvas(canvas_id: str):
-    canvas = load_canvas(canvas_id)
-    save_canvas(canvas)
+    canvas = mutate_canvas(canvas_id, lambda c: None)
     return {"canvas": canvas_record(canvas), "updated_at": canvas.get("updated_at", 0)}
 
 @app.get("/api/canvas-assets")
@@ -17601,43 +17763,51 @@ async def batch_crop_asset_library_items(payload: AssetLibraryBatchCropRequest):
 
 @app.put("/api/canvases/{canvas_id}")
 async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
-    canvas = load_canvas(canvas_id)
-    current_updated_at = int(canvas.get("updated_at") or 0)
-    if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
-        raise HTTPException(status_code=409, detail={
-            "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
-            "canvas": canvas,
-            "updated_at": current_updated_at,
-        })
-    canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
-    canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
-    canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
-    canvas["nodes"] = payload.nodes
-    canvas["connections"] = payload.connections
-    if canvas["kind"] == "smart":
-        canvas["viewport"] = payload.viewport
-    else:
-        canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
-    canvas["logs"] = payload.logs[-500:]
-    canvas["settings"] = payload.settings or {}
-    save_canvas(canvas)
+    def apply(canvas):
+        # 乐观并发检查必须在锁内做。放在锁外会出现 TOCTOU：读到 updated_at 之后、
+        # 真正写入之前，另一个请求已经保存过，于是本次比较基于过期的值通过，
+        # 静默覆盖掉那次保存。锁内比较才能保证检查与写入之间没有窗口。
+        current_updated_at = int(canvas.get("updated_at") or 0)
+        if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
+            raise HTTPException(status_code=409, detail={
+                "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
+                "canvas": canvas,
+                "updated_at": current_updated_at,
+            })
+        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+        canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
+        canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
+        canvas["nodes"] = payload.nodes
+        canvas["connections"] = payload.connections
+        if canvas["kind"] == "smart":
+            canvas["viewport"] = payload.viewport
+        else:
+            canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
+        canvas["logs"] = payload.logs[-500:]
+        canvas["settings"] = payload.settings or {}
+
+    canvas = mutate_canvas(canvas_id, apply)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), payload.client_id)
     return {"canvas": canvas}
 
 @app.delete("/api/canvases/{canvas_id}")
 async def delete_canvas(canvas_id: str):
-    canvas = load_canvas_any(canvas_id)
-    if not canvas.get("deleted_at"):
+    def apply(canvas):
+        if canvas.get("deleted_at"):
+            return False
         canvas["deleted_at"] = now_ms()
-        save_canvas(canvas)
+
+    mutate_canvas(canvas_id, apply, allow_deleted=True)
     return {"ok": True}
 
 @app.post("/api/canvases/{canvas_id}/restore")
 async def restore_canvas(canvas_id: str):
-    canvas = load_canvas_any(canvas_id)
-    if canvas.get("deleted_at"):
+    def apply(canvas):
+        if not canvas.get("deleted_at"):
+            return False
         canvas.pop("deleted_at", None)
-        save_canvas(canvas)
+
+    canvas = mutate_canvas(canvas_id, apply, allow_deleted=True)
     return {"canvas": canvas}
 
 @app.delete("/api/canvases/{canvas_id}/purge")
@@ -18087,8 +18257,9 @@ async def delete_history(req: DeleteHistoryRequest):
                 else:
                     new_history.append(item)
             if target_record:
-                with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(new_history, f, ensure_ascii=False, indent=4)
+                # 已在上面的 HISTORY_LOCK 内，这里不能再加锁：Lock 不可重入，
+                # 嵌套获取会直接把请求线程挂死。
+                atomic_write_json(HISTORY_FILE, new_history, indent=4)
 
         if target_record:
             for img_url in target_record.get("images", []):
@@ -18760,8 +18931,7 @@ def load_runninghub_workflow_store():
 
 def save_runninghub_workflow_store(store):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(RUNNINGHUB_WORKFLOW_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
+    atomic_write_json(RUNNINGHUB_WORKFLOW_STORE_FILE, store, indent=2)
 
 def prune_runninghub_workflow_store_for_provider(provider):
     if not isinstance(provider, dict) or provider.get("id") != "runninghub":
@@ -19271,8 +19441,7 @@ def upload_workflow(payload: WorkflowUploadRequest):
     os.makedirs(custom_dir, exist_ok=True)
     stored_name = f"{CUSTOM_WORKFLOW_FOLDER}/{name}"
     path = workflow_path_from_name(stored_name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload.workflow, f, ensure_ascii=False, indent=2)
+    atomic_write_json(path, payload.workflow, indent=2)
     return {"name": stored_name}
 
 @app.put("/api/workflows/{name:path}/config")
@@ -19283,8 +19452,7 @@ def save_workflow_config(name: str, payload: WorkflowConfig):
     if not os.path.exists(workflow_path):
         raise HTTPException(status_code=404, detail="Workflow not found")
     cfg_path = workflow_config_path(name)
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(payload.dict(), f, ensure_ascii=False, indent=2)
+    atomic_write_json(cfg_path, payload.dict(), indent=2)
     return {"config": payload.dict()}
 
 @app.delete("/api/workflows/{name:path}")
@@ -19516,8 +19684,7 @@ def skill_read_meta(dir_path):
 
 def skill_write_meta(dir_path, meta):
     try:
-        with open(os.path.join(dir_path, SKILL_META_FILE), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        atomic_write_json(os.path.join(dir_path, SKILL_META_FILE), meta, indent=2)
         return True
     except Exception:
         return False

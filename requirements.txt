@@ -1,7 +1,17 @@
-fastapi
-uvicorn
-requests
-pydantic
-python-multipart
-httpx
-pillow
+# 版本已锁定：这些是开发环境与生产环境（C:\Infinite-Canvas）当前实际运行的版本，
+# 也是全部测试通过时的版本。
+#
+# 之前这里完全不写版本（fastapi 而不是 fastapi==0.141.1），意味着每次 pip install
+# 都会拉到当天的最新版。FastAPI / Pydantic / Starlette 三者互相牵制，跨小版本升级
+# 经常直接让服务起不来，而问题只会在部署那一刻暴露。锁定后"装出来能跑"这件事
+# 才可复现。
+#
+# 升级方式：先在开发环境 pip install -U 目标包，跑通
+# `python -m unittest discover -s tests -p "test_*.py"`，再同步更新这里的版本号。
+fastapi==0.141.1
+uvicorn==0.52.1
+requests==2.34.2
+pydantic==2.13.4
+python-multipart==0.0.32
+httpx==0.28.1
+pillow==12.3.0

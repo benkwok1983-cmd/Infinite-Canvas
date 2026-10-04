@@ -25,7 +25,7 @@
     </script>
     <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.28.1788924940"></script>
     <script src="/static/js/theme.js?v=2026.08.28.1788924902"></script>
-    <script src="/static/js/i18n.js?v=2026.08.28.1789807303"></script>
+    <script src="/static/js/i18n.js?v=2026.08.28.1789824753"></script>
     <style>
         @import url('/static/vendor/css/fonts.css?v=2026.08.28.1788924921');
 
@@ -1045,6 +1045,9 @@
         .update-source-card { width:100%; min-width:0; border:1px solid #e5e7eb; border-radius:10px; background:#fff; color:#111827; text-align:left; padding:12px; display:flex; flex-direction:column; gap:10px; cursor:pointer; transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease, background .16s ease; }
         .update-source-card:hover { transform:translateY(-1px); border-color:#cbd5e1; box-shadow:0 12px 28px rgba(15,23,42,.08); }
         .update-source-card.active { border-color:#16a34a; box-shadow:0 0 0 2px rgba(22,163,74,.20); background:#f0fdf4; }
+        .update-source-card:disabled { cursor:not-allowed; opacity:.62; border-style:dashed; }
+        .update-source-card:disabled:hover { transform:none; border-color:#e5e7eb; box-shadow:none; }
+        .update-source-note { font-size:11px; line-height:1.5; color:#b45309; background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:7px 9px; }
         .update-source-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
         .update-source-title { min-width:0; display:flex; flex-direction:column; gap:4px; }
         .update-source-title strong { color:#111827; font-size:13px; line-height:1.2; font-weight:950; }
@@ -1673,17 +1676,17 @@
         </script>
 
         <main class="stage">
-            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.28.1789807334" class="active" scrolling="yes"></iframe>
-            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
-            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
-            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
-            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
-            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
+            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.28.1789835821" class="active" scrolling="yes"></iframe>
+            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
+            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
+            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
+            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
+            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
             <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.28.1789746210" scrolling="yes"></iframe>
             <iframe id="frame-skill-manager" data-src="/static/skill-manager.html?v=2026.08.28.1789813523" scrolling="yes"></iframe>
-            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
-            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
-            <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.28.1789807334" scrolling="yes"></iframe>
+            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
+            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
+            <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.28.1789835821" scrolling="yes"></iframe>
 
         </main>
     </div>
@@ -1728,7 +1731,7 @@
                         </div>
                         <div class="connectivity-list" data-connectivity-source="github"></div>
                     </button>
-                    <button id="update-source-modelscope" class="update-source-card" type="button" data-update-source="modelscope" onclick="setUpdateSource('modelscope')">
+                    <button id="update-source-modelscope" class="update-source-card" type="button" data-update-source="modelscope" onclick="setUpdateSource('modelscope')" disabled title="ModelScope 上的发布页仍是上游版本，从该源更新会覆盖本 fork 独有的功能（Codex 生图、Skill）。请使用 GitHub 源。">
                         <div class="update-source-head">
                             <div class="update-source-title">
                                 <strong>ModelScope 下载源</strong>
@@ -1738,10 +1741,11 @@
                                 <span class="update-source-check" aria-hidden="true">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
                                 </span>
-                                <span class="update-source-badge">待测试</span>
+                                <span class="update-source-badge">已停用</span>
                             </div>
                         </div>
                         <div class="connectivity-list" data-connectivity-source="modelscope"></div>
+                        <div class="update-source-note">本项目是上游的 fork，ModelScope 上的发布页仍是上游版本，从该源更新会覆盖本 fork 独有的功能（Codex 生图、Skill）。请使用 GitHub 源。</div>
                     </button>
                 </div>
                 <div id="project-update-summary" class="update-modal-summary warn">
@@ -1801,7 +1805,10 @@
         let updateConnectivityResult = null;
         let projectUpdateRunning = false;
         let projectUpdateAbort = null;  // 当前更新请求的 AbortController，便于用户中途取消
-        let updateSource = localStorage.getItem('studio_update_source') || 'github';
+        // ModelScope 发布页仍是上游仓库，本 fork 已停用该更新源（见 main.py
+        // ALLOW_MODELSCOPE_UPDATE_SOURCE），此处同步兜底，避免历史遗留的 localStorage
+        // 值把界面停用卡片重新选成当前源。
+let updateSource = localStorage.getItem('studio_update_source') === 'modelscope' ? 'github' : 'github';
         let projectUpdateNotes = null;
 
         function setSidebarPinned(pinned, options = {}) {
@@ -2278,7 +2285,9 @@
         }
 
         function setUpdateSource(source) {
-            updateSource = source === 'modelscope' ? 'modelscope' : 'github';
+            // ModelScope 源已停用（发布页仍是上游版本，更新会覆盖 fork 独有功能）
+            if (source === 'modelscope') return;
+            updateSource = 'github';
             localStorage.setItem('studio_update_source', updateSource);
             refreshProjectUpdateModalText();
         }
